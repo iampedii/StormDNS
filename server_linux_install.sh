@@ -18,6 +18,10 @@ log_success() { echo -e "${GREEN}[DONE]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || log_error "Missing command: $1"; }
+RELEASE_REPO="${STORMDNS_RELEASE_REPO:-iampedii/StormDNS}"
+if [[ ! "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  log_error "Invalid release repository: $RELEASE_REPO"
+fi
 backup_file_once() {
   local f="$1"
   [[ -f "$f" && ! -f "${f}.bak" ]] && cp -a "$f" "${f}.bak"
@@ -61,11 +65,12 @@ select_release_artifact() {
 
   local base_url
   if [[ -n "$version" ]]; then
-    base_url="https://github.com/nullroute1970/StormDNS/releases/download/${version}"
+    base_url="https://github.com/${RELEASE_REPO}/releases/download/${version}"
     log_info "Targeting StormDNS release: ${version}"
   else
-    base_url="https://github.com/nullroute1970/StormDNS/releases/latest/download"
+    base_url="https://github.com/${RELEASE_REPO}/releases/latest/download"
   fi
+  log_info "Using release repository: ${RELEASE_REPO}"
 
   case "$arch" in
     aarch64|arm64)
@@ -101,7 +106,7 @@ print_usage() {
 StormDNS Server Linux Installer
 
 Usage:
-  bash <(curl -Ls https://raw.githubusercontent.com/nullroute1970/StormDNS/main/server_linux_install.sh) [OPTIONS]
+  bash <(curl -Ls https://raw.githubusercontent.com/iampedii/StormDNS/main/server_linux_install.sh) [OPTIONS]
 
 Options:
   -v, --version <VERSION>   Install a specific StormDNS release (tag), e.g. v1.2.3.
@@ -113,13 +118,16 @@ Options:
 
 Examples:
   # Install the latest release (default behavior):
-  bash <(curl -Ls https://raw.githubusercontent.com/nullroute1970/StormDNS/main/server_linux_install.sh)
+  bash <(curl -Ls https://raw.githubusercontent.com/iampedii/StormDNS/main/server_linux_install.sh)
 
   # Install a specific release version:
-  bash <(curl -Ls https://raw.githubusercontent.com/nullroute1970/StormDNS/main/server_linux_install.sh) --version v1.2.3
+  bash <(curl -Ls https://raw.githubusercontent.com/iampedii/StormDNS/main/server_linux_install.sh) --version v1.2.3
+
+  # Override the release repository without editing the installer:
+  STORMDNS_RELEASE_REPO=iampedii/StormDNS bash <(curl -Ls https://raw.githubusercontent.com/iampedii/StormDNS/main/server_linux_install.sh) --version v1.2.3
 
   # Uninstall StormDNS:
-  bash <(curl -Ls https://raw.githubusercontent.com/nullroute1970/StormDNS/main/server_linux_install.sh) --uninstall
+  bash <(curl -Ls https://raw.githubusercontent.com/iampedii/StormDNS/main/server_linux_install.sh) --uninstall
 USAGE
 }
 
