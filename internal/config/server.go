@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -10,6 +10,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -58,6 +59,11 @@ type ServerConfig struct {
 	DNSUpstreamTimeoutSecs            float64  `toml:"DNS_UPSTREAM_TIMEOUT"`
 	DNSInflightWaitTimeoutSecs        float64  `toml:"DNS_INFLIGHT_WAIT_TIMEOUT_SECONDS"`
 	SOCKSConnectTimeoutSecs           float64  `toml:"SOCKS_CONNECT_TIMEOUT"`
+	SOCKSBlockPorts                   []int    `toml:"SOCKS_BLOCK_PORTS"`
+	SOCKSAllowPorts                   []int    `toml:"SOCKS_ALLOW_PORTS"`
+	SOCKSBlockHosts                   []string `toml:"SOCKS_BLOCK_HOSTS"`
+	SOCKSBlockCIDRs                   []string `toml:"SOCKS_BLOCK_CIDRS"`
+	SOCKSConnectConcurrency           int      `toml:"SOCKS_CONNECT_CONCURRENCY"`
 	DNSFragmentAssemblyTimeoutSecs    float64  `toml:"DNS_FRAGMENT_ASSEMBLY_TIMEOUT"`
 	StreamSetupAckTTLSeconds          float64  `toml:"STREAM_SETUP_ACK_TTL_SECONDS"`
 	StreamResultPacketTTLSeconds      float64  `toml:"STREAM_RESULT_PACKET_TTL_SECONDS"`
@@ -141,7 +147,12 @@ func defaultServerConfig() ServerConfig {
 		DNSUpstreamServers:                []string{"1.1.1.1:53"},
 		DNSUpstreamTimeoutSecs:            4.0,
 		DNSInflightWaitTimeoutSecs:        8.0,
-		SOCKSConnectTimeoutSecs:           8.0,
+		SOCKSConnectTimeoutSecs:           3.0,
+		SOCKSBlockPorts:                   []int{25, 53, 123, 135, 137, 138, 139, 445, 1900},
+		SOCKSAllowPorts:                   nil,
+		SOCKSBlockHosts:                   nil,
+		SOCKSBlockCIDRs:                   nil,
+		SOCKSConnectConcurrency:           8,
 		DNSFragmentAssemblyTimeoutSecs:    300.0,
 		StreamSetupAckTTLSeconds:          400.0,
 		StreamResultPacketTTLSeconds:      300.0,
@@ -264,8 +275,8 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 		cfg.DeferredSessionQueueLimit = 256
 	}
 
-	if cfg.DeferredSessionQueueLimit > 14336 {
-		cfg.DeferredSessionQueueLimit = 14336
+	if cfg.DeferredSessionQueueLimit > 8192 {
+		cfg.DeferredSessionQueueLimit = 8192
 	}
 
 	cfg.SessionOrphanQueueInitialCap = clampInt(defaultIntBelow(cfg.SessionOrphanQueueInitialCap, 1, 64), 4, 4096)
@@ -328,8 +339,34 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	cfg.DNSInflightWaitTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.DNSInflightWaitTimeoutSecs, 8.0), 0.1, 120.0)
 
 	if cfg.SOCKSConnectTimeoutSecs <= 0 {
-		cfg.SOCKSConnectTimeoutSecs = 8.0
+		cfg.SOCKSConnectTimeoutSecs = 3.0
 	}
+
+	if cfg.SOCKSConnectTimeoutSecs > 15.0 {
+		cfg.SOCKSConnectTimeoutSecs = 15.0
+	}
+
+	cfg.SOCKSBlockPorts = normalizePortListWithDefault(
+		cfg.SOCKSBlockPorts,
+		[]int{25, 53, 123, 135, 137, 138, 139, 445, 1900},
+	)
+
+	cfg.SOCKSAllowPorts = normalizePortList(cfg.SOCKSAllowPorts)
+
+	cfg.SOCKSBlockHosts = normalizeHostList(cfg.SOCKSBlockHosts)
+
+	cfg.SOCKSBlockCIDRs = normalizeCIDRList(cfg.SOCKSBlockCIDRs)
+	for _, cidr := range cfg.SOCKSBlockCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return cfg, fmt.Errorf("invalid SOCKS_BLOCK_CIDRS entry %q: %w", cidr, err)
+		}
+	}
+
+	cfg.SOCKSConnectConcurrency = clampInt(
+		defaultIntBelow(cfg.SOCKSConnectConcurrency, 1, 8),
+		1,
+		1024,
+	)
 
 	if cfg.DNSFragmentAssemblyTimeoutSecs <= 0 {
 		cfg.DNSFragmentAssemblyTimeoutSecs = 300.0
@@ -500,6 +537,82 @@ func normalizeCompressionTypeList(values []int) []int {
 	if len(out) == 0 {
 		return []int{0}
 	}
+	return out
+}
+
+func normalizePortList(values []int) []int {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[int]struct{}, len(values))
+	out := make([]int, 0, len(values))
+
+	for _, value := range values {
+		if value < 1 || value > 65535 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+
+	return out
+}
+
+func normalizePortListWithDefault(values []int, defaults []int) []int {
+	normalized := normalizePortList(values)
+	if len(normalized) != 0 {
+		return normalized
+	}
+	return normalizePortList(defaults)
+}
+
+func normalizeHostList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+
+	for _, value := range values {
+		host := strings.ToLower(strings.TrimSpace(value))
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+
+	return out
+}
+
+func normalizeCIDRList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+
+	for _, value := range values {
+		cidr := strings.TrimSpace(value)
+		if cidr == "" {
+			continue
+		}
+		if _, ok := seen[cidr]; ok {
+			continue
+		}
+		seen[cidr] = struct{}{}
+		out = append(out, cidr)
+	}
+
 	return out
 }
 

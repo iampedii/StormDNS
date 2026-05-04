@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -97,4 +97,56 @@ func TestServerConfigFlagBinderBuildsOverridesForSetFlagsOnly(t *testing.T) {
 	if _, exists := overrides.Values["UDPHost"]; exists {
 		t.Fatalf("did not expect unset flag to appear in overrides: %#v", overrides.Values["UDPHost"])
 	}
+}
+
+func TestServerSOCKSPolicyConfigDefaultsAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "server_config.toml")
+
+	if err := os.WriteFile(configPath, []byte(""), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+
+	cfg, err := LoadServerConfigWithOverrides(configPath, ServerConfigOverrides{
+		Values: map[string]any{
+			"DeferredSessionQueueLimit": 20000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("LoadServerConfigWithOverrides returned error: %v", err)
+	}
+
+	if !containsInt(cfg.SOCKSBlockPorts, 53) {
+		t.Fatalf("expected SOCKS_BLOCK_PORTS default to include 53, got %+v", cfg.SOCKSBlockPorts)
+	}
+
+	if cfg.SOCKSConnectTimeoutSecs != 3.0 {
+		t.Fatalf("unexpected SOCKS_CONNECT_TIMEOUT default: got=%v want=3.0", cfg.SOCKSConnectTimeoutSecs)
+	}
+
+	if cfg.DeferredSessionQueueLimit != 8192 {
+		t.Fatalf("unexpected DEFERRED_SESSION_QUEUE_LIMIT clamp: got=%d want=8192", cfg.DeferredSessionQueueLimit)
+	}
+
+	if cfg.SOCKSConnectConcurrency != 8 {
+		t.Fatalf("unexpected SOCKS_CONNECT_CONCURRENCY default: got=%d want=8", cfg.SOCKSConnectConcurrency)
+	}
+
+	_, err = LoadServerConfigWithOverrides(configPath, ServerConfigOverrides{
+		Values: map[string]any{
+			"SOCKSBlockCIDRs": []string{"not-a-cidr"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid SOCKS_BLOCK_CIDRS to return an error")
+	}
+}
+
+func containsInt(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

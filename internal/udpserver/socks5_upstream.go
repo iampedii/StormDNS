@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -66,6 +66,31 @@ func (s *Server) dialSOCKSStreamTarget(host string, port uint16, targetPayload [
 	return s.dialSOCKSStreamTargetContext(context.Background(), host, port, targetPayload)
 }
 
+func (s *Server) tryAcquireSOCKSConnectSlot() (func(), bool) {
+	if s == nil || s.socksConnectSem == nil {
+		return func() {}, true
+	}
+
+	select {
+	case s.socksConnectSem <- struct{}{}:
+		return func() {
+			select {
+			case <-s.socksConnectSem:
+			default:
+			}
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func (s *Server) validateSOCKSTarget(host string, port uint16) error {
+	if s == nil {
+		return &blockedSOCKSTargetError{host: net.JoinHostPort(host, strconv.Itoa(int(port)))}
+	}
+	return s.socksTargetPolicy.Validate(host, port)
+}
+
 func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, port uint16, targetPayload []byte) (net.Conn, error) {
 	if s == nil {
 		return nil, &upstreamSOCKS5Error{
@@ -74,14 +99,46 @@ func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, 
 		}
 	}
 
-	if err := validateSOCKSTargetHost(host); err != nil {
+	if err := s.validateSOCKSTarget(host, port); err != nil {
 		return nil, err
 	}
 
-	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
-		return s.dialTCPTargetContext(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+	release, ok := s.tryAcquireSOCKSConnectSlot()
+	if !ok {
+		s.socksConnectLimited.Add(1)
+		return nil, &upstreamSOCKS5Error{
+			packetType: Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE,
+			err:        errors.New("socks connect concurrency limit reached"),
+		}
 	}
-	return s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
+	defer release()
+
+	s.socksConnectStarted.Add(1)
+	defer s.socksConnectFinished.Add(1)
+
+	var (
+		conn net.Conn
+		err  error
+	)
+
+	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
+		conn, err = s.dialTCPTargetContext(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+	} else {
+		conn, err = s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
+	}
+
+	if err != nil {
+		var netErr net.Error
+		if ctx != nil && ctx.Err() != nil {
+			s.socksConnectTimeouts.Add(1)
+		} else if errors.As(err, &netErr) && netErr.Timeout() {
+			s.socksConnectTimeouts.Add(1)
+		} else if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			s.socksConnectTimeouts.Add(1)
+		}
+	}
+
+	return conn, err
 }
 
 func validateSOCKSTargetHost(host string) error {
@@ -131,6 +188,9 @@ func (s *Server) dialTCPTargetContext(ctx context.Context, address string) (net.
 	timeout := s.socksConnectTimeout
 	if timeout <= 0 {
 		timeout = s.cfg.SOCKSConnectTimeout()
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		untilDeadline := time.Until(deadline)
@@ -210,6 +270,9 @@ func (s *Server) dialExternalSOCKS5TargetContext(ctx context.Context, targetPayl
 	timeout := s.socksConnectTimeout
 	if timeout <= 0 {
 		timeout = s.cfg.SOCKSConnectTimeout()
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
 	}
 	if timeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(timeout))

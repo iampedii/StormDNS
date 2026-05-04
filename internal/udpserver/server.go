@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -62,6 +62,8 @@ type Server struct {
 	invalidCookieWindowNanos int64
 	invalidCookieThreshold   int
 	socksConnectTimeout      time.Duration
+	socksTargetPolicy        socksTargetPolicy
+	socksConnectSem          chan struct{}
 	useExternalSOCKS5        bool
 	externalSOCKS5Address    string
 	externalSOCKS5Auth       bool
@@ -92,6 +94,11 @@ type Server struct {
 	fragmentInvalidHeader   atomic.Uint64
 	upstreamPanicsRecovered atomic.Uint64
 	cleanupPanicsRecovered  atomic.Uint64
+	socksConnectDenied      atomic.Uint64
+	socksConnectLimited     atomic.Uint64
+	socksConnectStarted     atomic.Uint64
+	socksConnectFinished    atomic.Uint64
+	socksConnectTimeouts    atomic.Uint64
 }
 
 // Stats is a point-in-time snapshot of operational counters maintained by the
@@ -107,6 +114,11 @@ type Stats struct {
 	FragmentInvalidHeader   uint64
 	UpstreamPanicsRecovered uint64
 	CleanupPanicsRecovered  uint64
+	SOCKSConnectDenied      uint64
+	SOCKSConnectLimited     uint64
+	SOCKSConnectStarted     uint64
+	SOCKSConnectFinished    uint64
+	SOCKSConnectTimeouts    uint64
 }
 
 // Stats returns a consistent snapshot of the server's observability counters.
@@ -130,6 +142,11 @@ func (s *Server) Stats() Stats {
 		FragmentInvalidHeader:   s.fragmentInvalidHeader.Load(),
 		UpstreamPanicsRecovered: s.upstreamPanicsRecovered.Load(),
 		CleanupPanicsRecovered:  s.cleanupPanicsRecovered.Load(),
+		SOCKSConnectDenied:      s.socksConnectDenied.Load(),
+		SOCKSConnectLimited:     s.socksConnectLimited.Load(),
+		SOCKSConnectStarted:     s.socksConnectStarted.Load(),
+		SOCKSConnectFinished:    s.socksConnectFinished.Load(),
+		SOCKSConnectTimeouts:    s.socksConnectTimeouts.Load(),
 	}
 }
 
@@ -160,10 +177,15 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	}
 	socksConnectTimeout := cfg.SOCKSConnectTimeout()
 	if socksConnectTimeout <= 0 {
-		socksConnectTimeout = 8 * time.Second
+		socksConnectTimeout = 3 * time.Second
 	}
 	dnsDeferredWorkers, connectDeferredWorkers, dnsDeferredQueue, connectDeferredQueue := splitDeferredSessionPools(cfg.DeferredSessionWorkers, cfg.DeferredSessionQueueLimit)
-	return &Server{
+	var socksConnectSem chan struct{}
+	if cfg.SOCKSConnectConcurrency > 0 {
+		socksConnectSem = make(chan struct{}, cfg.SOCKSConnectConcurrency)
+	}
+
+	srv := &Server{
 		cfg:                    cfg,
 		log:                    log,
 		codec:                  codec,
@@ -197,6 +219,8 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		invalidCookieWindowNanos: invalidCookieWindow.Nanoseconds(),
 		invalidCookieThreshold:   cfg.InvalidCookieErrorThreshold,
 		socksConnectTimeout:      socksConnectTimeout,
+		socksTargetPolicy:        newSOCKSTargetPolicy(cfg),
+		socksConnectSem:          socksConnectSem,
 		useExternalSOCKS5:        cfg.UseExternalSOCKS5,
 		externalSOCKS5Address:    net.JoinHostPort(cfg.ForwardIP, strconv.Itoa(cfg.ForwardPort)),
 		externalSOCKS5Auth:       cfg.SOCKS5Auth,
@@ -214,6 +238,20 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 	}
+
+	if srv.log != nil {
+		srv.log.Infof(
+			"SOCKS policy enabled | block_ports=%v | allow_ports=%v | block_hosts=%v | block_cidrs=%v | connect_concurrency=%d | connect_timeout=%s",
+			cfg.SOCKSBlockPorts,
+			cfg.SOCKSAllowPorts,
+			cfg.SOCKSBlockHosts,
+			cfg.SOCKSBlockCIDRs,
+			cfg.SOCKSConnectConcurrency,
+			socksConnectTimeout,
+		)
+	}
+
+	return srv
 }
 
 type throttledLogState struct {

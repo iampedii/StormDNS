@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -28,7 +28,7 @@ func (s *Server) deferredConnectAttemptTimeout() time.Duration {
 		timeout = s.cfg.SOCKSConnectTimeout()
 	}
 	if timeout <= 0 {
-		timeout = 8 * time.Second
+		timeout = 3 * time.Second
 	}
 	if timeout > maxDeferredConnectAttemptTimeout {
 		return maxDeferredConnectAttemptTimeout
@@ -294,6 +294,43 @@ func (s *Server) processDeferredSOCKS5Syn(ctx context.Context, vpnPacket VpnProt
 			nil,
 			s.cfg.StreamFailurePacketTTL(),
 		)
+		s.finalizeStreamArtifacts(vpnPacket.SessionID, vpnPacket.StreamID)
+		return
+	}
+
+	if err := s.validateSOCKSTarget(target.Host, target.Port); err != nil {
+		s.socksConnectDenied.Add(1)
+
+		if !s.shouldExecuteDeferredPacket(vpnPacket) {
+			return
+		}
+
+		packetType := s.mapSOCKSConnectError(err)
+
+		if s.log != nil {
+			s.log.Debugf(
+				"SOCKS5 target denied | Session: %d | Stream: %d | Target: %s:%d | Packet: %s | %v",
+				vpnPacket.SessionID,
+				vpnPacket.StreamID,
+				target.Host,
+				target.Port,
+				Enums.PacketTypeName(packetType),
+				err,
+			)
+		}
+
+		stream.ARQ.SendControlPacketWithTTL(
+			packetType,
+			vpnPacket.SequenceNum,
+			0,
+			0,
+			nil,
+			Enums.DefaultPacketPriority(packetType),
+			true,
+			nil,
+			s.cfg.StreamFailurePacketTTL(),
+		)
+
 		s.finalizeStreamArtifacts(vpnPacket.SessionID, vpnPacket.StreamID)
 		return
 	}
