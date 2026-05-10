@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -90,9 +90,9 @@ func (c *Client) runFullMTUTests(ctx context.Context) error {
 	}
 
 	counters := &mtuScanCounters{}
+	c.logMTUProgress(counters, len(c.connections))
 	c.runAllMTUProbeWorkers(ctx, uploadCaps, workerCount, counters, nil)
 
-	c.balancer.RefreshValidConnections()
 	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
 	if len(validConns) == 0 {
 		if c.log != nil {
@@ -100,10 +100,15 @@ func (c *Client) runFullMTUTests(ctx context.Context) error {
 		}
 		return ErrNoValidConnections
 	}
+	selectedConns, minUpload, minDownload, minUploadChars := c.finalizeValidResolvers(validConns)
+	if len(selectedConns) == 0 {
+		return ErrNoValidConnections
+	}
 
 	c.applySyncedMTUState(minUpload, minDownload, minUploadChars)
+	c.logConnectionProgress("selecting", 85, "valid", len(validConns))
 	c.initResolverRecheckMeta()
-	c.logMTUCompletion(validConns)
+	c.logMTUCompletion(selectedConns)
 	return nil
 }
 
@@ -202,6 +207,7 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 						rejectedNow,
 					)
 				}
+				c.logMTUProgress(counters, total)
 			}
 		}
 	}()
@@ -237,6 +243,7 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 				rejectedNow,
 			)
 		}
+		c.logMTUProgress(counters, total)
 		return
 	case mtuRejectDownload:
 		completed := counters.completed.Add(1)
@@ -253,6 +260,7 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 				rejectedNow,
 			)
 		}
+		c.logMTUProgress(counters, total)
 		return
 	}
 
@@ -278,6 +286,7 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 			rejectedNow,
 		)
 	}
+	c.logMTUProgress(counters, total)
 	c.appendResolverCacheEntry(conn)
 }
 
@@ -837,7 +846,7 @@ func (c *Client) applyPreknownMTUsFromLog(ctx context.Context) error {
 		return ErrNoValidConnections
 	}
 
-	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
+	validConns, _, _, _ := summarizeValidMTUConnections(c.connections)
 	if len(validConns) == 0 {
 		return ErrNoValidConnections
 	}
@@ -850,8 +859,24 @@ func (c *Client) applyPreknownMTUsFromLog(ctx context.Context) error {
 		}
 	}
 
-	c.balancer.RefreshValidConnections()
+	selectedConns, minUpload, minDownload, minUploadChars := c.finalizeValidResolvers(validConns)
+	if len(selectedConns) == 0 {
+		return ErrNoValidConnections
+	}
 	c.applySyncedMTUState(minUpload, minDownload, minUploadChars)
+	c.logConnectionProgress(
+		"mtu",
+		80,
+		"completed",
+		len(c.connections),
+		"total",
+		len(c.connections),
+		"valid",
+		len(validConns),
+		"rejected",
+		len(c.connections)-len(validConns),
+	)
+	c.logConnectionProgress("selecting", 85, "valid", len(validConns))
 	c.initResolverRecheckMeta()
 
 	if c.log != nil {
@@ -860,7 +885,7 @@ func (c *Client) applyPreknownMTUsFromLog(ctx context.Context) error {
 			len(validConns),
 		)
 	}
-	c.logMTUCompletion(validConns)
+	c.logMTUCompletion(selectedConns)
 	return nil
 }
 

@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -75,6 +75,23 @@ func TestLoggerSuppressesBelowLevel(t *testing.T) {
 	}
 	if !strings.Contains(output, "warn message") {
 		t.Fatal("warn message should be logged at WARN level")
+	}
+}
+
+func TestLoggerMachineBypassesConfiguredLevel(t *testing.T) {
+	var buf bytes.Buffer
+	l := &Logger{
+		name:          "test",
+		level:         levelWarn,
+		consoleWriter: &buf,
+		color:         false,
+		appNameText:   "[test]",
+	}
+
+	l.Machinef("WD_PROGRESS phase=mtu percent=50")
+
+	if !strings.Contains(buf.String(), "WD_PROGRESS phase=mtu percent=50") {
+		t.Fatal("machine log should bypass configured level")
 	}
 }
 

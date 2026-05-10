@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -87,6 +87,7 @@ func (c *Client) runTrafficStatsReporter(ctx context.Context) {
 					formatSpeed(downSpeed),
 					formatBytes(currentRX),
 				)
+				c.logResolverRuntimeState()
 			}
 		}
 	}

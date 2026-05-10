@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -552,12 +552,20 @@ func (c *Client) sendSocksReply(conn net.Conn, rep byte, atyp byte, bndAddr net.
 	reply := []byte{SOCKS5_VERSION, rep, 0x00, atyp}
 
 	if atyp == SOCKS5_ATYP_IPV4 {
-		reply = append(reply, bndAddr.To4()...)
+		ip4 := bndAddr.To4()
+		if ip4 == nil {
+			ip4 = net.IPv4(0, 0, 0, 0).To4()
+		}
+		reply = append(reply, ip4...)
 	} else if atyp == SOCKS5_ATYP_IPV6 {
-		reply = append(reply, bndAddr.To16()...)
+		ip6 := bndAddr.To16()
+		if ip6 == nil {
+			ip6 = net.IPv6zero
+		}
+		reply = append(reply, ip6...)
 	} else if atyp == SOCKS5_ATYP_DOMAIN {
 		reply[3] = SOCKS5_ATYP_IPV4
-		reply = append(reply, net.IPv4zero...)
+		reply = append(reply, net.IPv4(0, 0, 0, 0).To4()...)
 	}
 
 	pBuf := make([]byte, 2)
@@ -569,8 +577,9 @@ func (c *Client) sendSocksReply(conn net.Conn, rep byte, atyp byte, bndAddr net.
 
 func (c *Client) rejectSocksUDPAssociateUnsupportedTarget(conn net.Conn, targetAddr string, targetPort uint16) {
 	if c.log != nil {
-		c.log.Debugf("⚠️ <yellow>SOCKS5 UDP packet to unsupported target %s:%d rejected (Only DNS/53 allowed).</yellow>", targetAddr, targetPort)
+		c.log.Debugf("⚠️ <yellow>SOCKS5 UDP packet to unsupported target %s:%d rejected; closing UDP association to force client fallback (Only DNS/53 allowed).</yellow>", targetAddr, targetPort)
 	}
+	_ = conn.Close()
 }
 
 func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, clientAddr string, clientPort uint16, atyp byte) {
@@ -662,7 +671,7 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 
 		if targetPort != 53 {
 			c.rejectSocksUDPAssociateUnsupportedTarget(conn, targetAddr, targetPort)
-			continue
+			return
 		}
 
 		c.log.Infof("📡 <green>Received DNS Query from SOCKS5 UDP: <cyan>%d bytes</cyan>, Target: <cyan>%s:%d</cyan></green>", n-payloadOffset, targetAddr, targetPort)
