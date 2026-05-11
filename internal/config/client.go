@@ -100,6 +100,8 @@ type ClientConfig struct {
 	OrphanQueueInitialCapacity           int               `toml:"ORPHAN_QUEUE_INITIAL_CAPACITY"`
 	DNSResponseFragmentStoreCap          int               `toml:"DNS_RESPONSE_FRAGMENT_STORE_CAPACITY"`
 	DNSResponseFragmentTimeoutSeconds    float64           `toml:"DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS"`
+	MaxActiveStreams                     int               `toml:"MAX_ACTIVE_STREAMS"`
+	LocalHandshakeTimeoutSeconds         float64           `toml:"LOCAL_HANDSHAKE_TIMEOUT_SECONDS"`
 	SOCKSUDPAssociateReadTimeoutSeconds  float64           `toml:"SOCKS_UDP_ASSOCIATE_READ_TIMEOUT_SECONDS"`
 	ClientTerminalStreamRetentionSeconds float64           `toml:"CLIENT_TERMINAL_STREAM_RETENTION_SECONDS"`
 	ClientCancelledSetupRetentionSeconds float64           `toml:"CLIENT_CANCELLED_SETUP_RETENTION_SECONDS"`
@@ -217,6 +219,8 @@ func defaultClientConfig() ClientConfig {
 		OrphanQueueInitialCapacity:            128,
 		DNSResponseFragmentStoreCap:           1024,
 		DNSResponseFragmentTimeoutSeconds:     60.0,
+		MaxActiveStreams:                      2048,
+		LocalHandshakeTimeoutSeconds:          5.0,
 		SOCKSUDPAssociateReadTimeoutSeconds:   30.0,
 		ClientTerminalStreamRetentionSeconds:  45.0,
 		ClientCancelledSetupRetentionSeconds:  120.0,
@@ -479,6 +483,8 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.OrphanQueueInitialCapacity = clampInt(defaultIntBelow(cfg.OrphanQueueInitialCapacity, 1, 32), 4, 4096)
 	cfg.DNSResponseFragmentStoreCap = clampInt(defaultIntBelow(cfg.DNSResponseFragmentStoreCap, 1, 256), 16, 16384)
 	cfg.DNSResponseFragmentTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.DNSResponseFragmentTimeoutSeconds, 10.0), 1.0, 600.0)
+	cfg.MaxActiveStreams = clampInt(defaultIntBelow(cfg.MaxActiveStreams, 1, 2048), 1, 65535)
+	cfg.LocalHandshakeTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.LocalHandshakeTimeoutSeconds, 5.0), 0.5, 60.0)
 	cfg.SOCKSUDPAssociateReadTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.SOCKSUDPAssociateReadTimeoutSeconds, 30.0), 1.0, 3600.0)
 	cfg.ClientTerminalStreamRetentionSeconds = clampFloat(defaultFloatAtMostZero(cfg.ClientTerminalStreamRetentionSeconds, 45.0), 1.0, 3600.0)
 	cfg.ClientCancelledSetupRetentionSeconds = clampFloat(defaultFloatAtMostZero(cfg.ClientCancelledSetupRetentionSeconds, 120.0), 1.0, 3600.0)
@@ -638,6 +644,10 @@ func (c ClientConfig) PingWatchdogTimeout() time.Duration {
 
 func (c ClientConfig) DNSResponseFragmentTimeout() time.Duration {
 	return time.Duration(c.DNSResponseFragmentTimeoutSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) LocalHandshakeTimeout() time.Duration {
+	return time.Duration(c.LocalHandshakeTimeoutSeconds * float64(time.Second))
 }
 
 func (c ClientConfig) SOCKSUDPAssociateReadTimeout() time.Duration {

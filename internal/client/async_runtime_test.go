@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -336,7 +336,7 @@ func TestStartAsyncRuntimeCollectsResolverTimeoutsEvenWhenHealthFeaturesDisabled
 	}, "expected resolver timeout sample to be collected even without auto-disable/recheck enabled")
 }
 
-func TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess(t *testing.T) {
+func TestHandleInboundPacketTreatsMissingTXTAsResolverFailure(t *testing.T) {
 	c := buildTestClientWithResolvers(config.ClientConfig{}, "a", "b", "c", "d")
 	c.initResolverRecheckMeta()
 	addr := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
@@ -362,7 +362,17 @@ func TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess(t *testing.T) {
 	c.handleInboundPacket(response, addr, "")
 
 	if len(c.resolverPending) != 0 {
-		t.Fatalf("expected resolverPending to be cleared after empty DNS success, got=%d", len(c.resolverPending))
+		t.Fatalf("expected resolverPending to be cleared after empty DNS response, got=%d", len(c.resolverPending))
+	}
+
+	c.resolverHealthMu.Lock()
+	state := c.resolverHealth["a"]
+	c.resolverHealthMu.Unlock()
+	if state == nil {
+		t.Fatal("expected resolver health state to exist")
+	}
+	if len(state.Events) != 1 {
+		t.Fatalf("expected one failure health event after missing tunnel TXT, got=%d", len(state.Events))
 	}
 }
 

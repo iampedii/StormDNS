@@ -42,6 +42,7 @@ type Client struct {
 
 	connections              []Connection
 	connectionsByKey         map[string]int
+	preparedDomains          map[string]preparedTunnelDomain
 	successMTUChecks         bool
 	udpBufferPool            sync.Pool
 	resolverConnsMu          sync.Mutex
@@ -103,8 +104,11 @@ type Client struct {
 	lastRXDropLogUnix   atomic.Int64
 
 	// Traffic byte counters (per-session, reset on resetRuntimeBindings)
-	txTotalBytes atomic.Uint64
-	rxTotalBytes atomic.Uint64
+	txTotalBytes                     atomic.Uint64
+	rxTotalBytes                     atomic.Uint64
+	lastTunnelSendUnix               atomic.Int64
+	lastTunnelResponseUnix           atomic.Int64
+	lastStreamAdmissionRejectLogUnix atomic.Int64
 
 	// Async Runtime Workers & Channels
 	asyncWG              sync.WaitGroup
@@ -285,6 +289,7 @@ func BootstrapFromLogs(configPath string, entries []ResolverCacheEntry, override
 	mtuLookup := buildResolverCacheMTULookup(entries)
 	for i := range c.connections {
 		conn := &c.connections[i]
+		c.prepareConnectionMTUScanState(conn)
 		key := makeConnectionKey(conn.Resolver, conn.ResolverPort, conn.Domain)
 		if e, ok := mtuLookup[key]; ok && e.UploadMTU > 0 && e.DownloadMTU > 0 {
 			conn.IsValid = true
@@ -332,6 +337,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		maxPackedBlocks:     1,
 		responseMode:        responseMode,
 		connectionsByKey:    make(map[string]int, len(cfg.Domains)*len(cfg.Resolvers)),
+		preparedDomains:     prepareTunnelDomains(cfg.Domains),
 		udpBufferPool: sync.Pool{
 			New: func() any {
 				return make([]byte, RuntimeUDPReadBufferSize)

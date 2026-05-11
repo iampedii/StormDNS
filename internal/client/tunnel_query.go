@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -32,6 +32,36 @@ func prepareTunnelDomain(domain string) (preparedTunnelDomain, error) {
 	return preparedTunnelDomain{normalized: normalized, qname: qname}, nil
 }
 
+func prepareTunnelDomains(domains []string) map[string]preparedTunnelDomain {
+	if len(domains) == 0 {
+		return nil
+	}
+	prepared := make(map[string]preparedTunnelDomain, len(domains))
+	for _, domain := range domains {
+		if domain == "" {
+			continue
+		}
+		value, err := prepareTunnelDomain(domain)
+		if err != nil {
+			continue
+		}
+		prepared[domain] = value
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+	return prepared
+}
+
+func (c *Client) preparedTunnelDomainFor(domain string) (preparedTunnelDomain, error) {
+	if c != nil && c.preparedDomains != nil {
+		if prepared, ok := c.preparedDomains[domain]; ok {
+			return prepared, nil
+		}
+	}
+	return prepareTunnelDomain(domain)
+}
+
 func buildTunnelTXTQuestionBytesPrepared(domain preparedTunnelDomain, encoded []byte) ([]byte, error) {
 	return DnsParser.BuildTunnelTXTQuestionPacketPrepared(domain.normalized, domain.qname, encoded, Enums.DNS_RECORD_TYPE_TXT, EDnsSafeUDPSize)
 }
@@ -46,7 +76,11 @@ func (c *Client) buildTunnelTXTQueryRaw(domain string, options VpnProto.BuildOpt
 	if err != nil {
 		return nil, err
 	}
-	return buildTunnelTXTQuestionBytes(domain, encoded)
+	prepared, err := c.preparedTunnelDomainFor(domain)
+	if err != nil {
+		return nil, err
+	}
+	return buildTunnelTXTQuestionBytesPrepared(prepared, encoded)
 }
 
 func (c *Client) buildEncodedAutoWithCompressionTrace(options VpnProto.BuildOptions) ([]byte, error) {
@@ -67,5 +101,9 @@ func (c *Client) buildTunnelTXTQuery(domain string, options VpnProto.BuildOption
 	if err != nil {
 		return nil, err
 	}
-	return buildTunnelTXTQuestionBytes(domain, encoded)
+	prepared, err := c.preparedTunnelDomainFor(domain)
+	if err != nil {
+		return nil, err
+	}
+	return buildTunnelTXTQuestionBytesPrepared(prepared, encoded)
 }

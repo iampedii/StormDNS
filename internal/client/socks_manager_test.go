@@ -109,6 +109,43 @@ func TestLateSocksResultDoesNotReactivateCancelledStream(t *testing.T) {
 	}
 }
 
+func TestSocksConnectRejectedWhenTunnelAdmissionClosed(t *testing.T) {
+	now := time.Unix(100, 0)
+	c := newAdmissionTestClient(now)
+	c.active_streams = make(map[uint16]*Stream_client)
+	c.recordTunnelResponse(now)
+	c.recordTunnelSend(now.Add(time.Second))
+	c.nowFn = func() time.Time {
+		return now.Add(10 * time.Second)
+	}
+
+	server, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{}, 1)
+	go func() {
+		c.handleSOCKSConnect(context.Background(), server, "example.com", 443, SOCKS5_ATYP_DOMAIN, SOCKS5_VERSION)
+		done <- struct{}{}
+	}()
+
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(clientConn, reply); err != nil {
+		t.Fatalf("failed to read SOCKS rejection: %v", err)
+	}
+	if reply[0] != SOCKS5_VERSION || reply[1] != SOCKS5_REPLY_NETWORK_UNREACHABLE {
+		t.Fatalf("unexpected SOCKS rejection reply: %#v", reply)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected rejected SOCKS connect to return")
+	}
+	if len(c.active_streams) != 0 {
+		t.Fatalf("expected no stream to be created, got %d", len(c.active_streams))
+	}
+}
+
 func TestSocksUDPAssociateUnsupportedTargetClosesAssociation(t *testing.T) {
 	c := &Client{}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

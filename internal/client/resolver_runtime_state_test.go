@@ -31,6 +31,22 @@ func TestFinalizeValidResolversKeepsAllValidResolversActive(t *testing.T) {
 	}
 }
 
+func TestSummarizeValidMTUConnectionsRejectsZeroMTUConnections(t *testing.T) {
+	connections := []Connection{
+		{Key: "missing-mtu", IsValid: true},
+		{Key: "valid", IsValid: true, UploadMTUBytes: 100, UploadMTUChars: 120, DownloadMTUBytes: 180},
+	}
+
+	valid, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(connections)
+
+	if len(valid) != 1 || valid[0].Key != "valid" {
+		t.Fatalf("expected only positive-MTU connections to be valid, got %+v", valid)
+	}
+	if minUpload != 100 || minDownload != 180 || minUploadChars != 120 {
+		t.Fatalf("unexpected MTU minima: up=%d down=%d chars=%d", minUpload, minDownload, minUploadChars)
+	}
+}
+
 func TestResolverRuntimeStateLogSuppressesDuplicateSnapshotsUntilHeartbeat(t *testing.T) {
 	c := buildTestClientWithResolvers(config.ClientConfig{}, "active", "standby")
 	now := time.Date(2026, 5, 7, 15, 0, 0, 0, time.UTC)

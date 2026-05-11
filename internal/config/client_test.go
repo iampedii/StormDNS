@@ -144,6 +144,8 @@ MTU_TEST_PARALLELISM_RESOLVERS = 0
 MTU_TEST_RETRIES_LOGS = 0
 MTU_TEST_TIMEOUT_LOGS = 0
 MTU_TEST_PARALLELISM_LOGS = 0
+MAX_ACTIVE_STREAMS = 999999
+LOCAL_HANDSHAKE_TIMEOUT_SECONDS = 0
 DATA_ENCRYPTION_METHOD = 1
 ENCRYPTION_KEY = "secret"
 `), 0o644); err != nil {
@@ -178,6 +180,12 @@ ENCRYPTION_KEY = "secret"
 	}
 	if cfg.MTUTestRetries != 3 || cfg.MTUTestTimeout != 2.0 || cfg.MTUTestParallelism != 100 {
 		t.Fatalf("unexpected mtu defaults: retries=%d timeout=%v parallelism=%d", cfg.MTUTestRetries, cfg.MTUTestTimeout, cfg.MTUTestParallelism)
+	}
+	if cfg.MaxActiveStreams != 65535 {
+		t.Fatalf("unexpected active stream clamp: got=%d want=%d", cfg.MaxActiveStreams, 65535)
+	}
+	if cfg.LocalHandshakeTimeoutSeconds != 5.0 {
+		t.Fatalf("unexpected local handshake timeout default: got=%v want=%v", cfg.LocalHandshakeTimeoutSeconds, 5.0)
 	}
 	if cfg.ProtocolType != "TCP" {
 		t.Fatal("tcp mode should be loaded")
