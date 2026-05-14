@@ -1853,6 +1853,89 @@ func TestARQ_CloseReadAckTimeoutEscalatesToRST(t *testing.T) {
 	}
 }
 
+func TestARQ_InactivityWithPendingDataClosesInsteadOfRefreshingActivity(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
+		WindowSize: 100,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	})
+
+	now := time.Now()
+	a.mu.Lock()
+	a.inactivityTimeout = time.Second
+	a.lastActivity = now
+	a.lastProgress = now.Add(-2 * time.Second)
+	a.sndBuf[9] = &arqDataItem{
+		Data:       []byte("stuck"),
+		CreatedAt:  now.Add(-2 * time.Second),
+		LastSentAt: now.Add(-2 * time.Second),
+		Dispatched: true,
+		CurrentRTO: a.rto,
+	}
+	a.mu.Unlock()
+
+	if !a.handleTerminalRetransmitState(now) {
+		t.Fatal("expected pending no-progress timeout to enter terminal handling")
+	}
+
+	a.mu.RLock()
+	rstSent := a.rstSent
+	state := a.state
+	sndBufLen := len(a.sndBuf)
+	a.mu.RUnlock()
+
+	if !rstSent || state != StateReset {
+		t.Fatalf("expected no-progress timeout to send RST and reset stream, rstSent=%t state=%v", rstSent, state)
+	}
+	if sndBufLen != 0 {
+		t.Fatalf("expected RST path to clear pending send buffer, got %d entries", sndBufLen)
+	}
+}
+
+func TestARQ_DataNackDoesNotRefreshNoProgressTimeout(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
+		WindowSize:            100,
+		RTO:                   0.1,
+		MaxRTO:                0.5,
+		DataNackRepeatSeconds: 0.1,
+	})
+
+	now := time.Now()
+	staleProgress := now.Add(-2 * time.Second)
+	a.mu.Lock()
+	a.inactivityTimeout = time.Second
+	a.lastActivity = now
+	a.lastProgress = staleProgress
+	a.sndBuf[9] = &arqDataItem{
+		Data:       []byte("stuck"),
+		CreatedAt:  now.Add(-2 * time.Second),
+		LastSentAt: now.Add(-2 * time.Second),
+		Dispatched: true,
+		CurrentRTO: a.rto,
+	}
+	a.mu.Unlock()
+
+	if !a.HandleDataNack(9) {
+		t.Fatal("expected DATA_NACK to enqueue a resend")
+	}
+
+	a.mu.RLock()
+	lastProgress := a.lastProgress
+	a.mu.RUnlock()
+	if !lastProgress.Equal(staleProgress) {
+		t.Fatalf("expected DATA_NACK to leave lastProgress unchanged, got %s want %s", lastProgress, staleProgress)
+	}
+
+	if !a.handleTerminalRetransmitState(now) {
+		t.Fatal("expected stale progress to close despite recent DATA_NACK activity")
+	}
+	if !a.IsReset() {
+		t.Fatal("expected stale DATA_NACK-only stream to be reset")
+	}
+}
+
 func TestARQ_GracefulCloseWriteFailureStillRechecksCloseReadCompletion(t *testing.T) {
 	enqueuer := NewMockPacketEnqueuer()
 	cfg := Config{

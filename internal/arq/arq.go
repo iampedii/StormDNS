@@ -143,6 +143,7 @@ type ARQ struct {
 	closed       bool
 	closeReason  string
 	lastActivity time.Time
+	lastProgress time.Time
 
 	closeReadSent     bool
 	closeReadReceived bool
@@ -348,6 +349,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 
 		state:        StateOpen,
 		lastActivity: time.Now(),
+		lastProgress: time.Now(),
 
 		windowSize:    windowSize,
 		limit:         limit,
@@ -355,7 +357,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		writeLock:     sync.Mutex{},
 		flushSignal:   make(chan struct{}, 1),
 
-		inactivityTimeout:    time.Duration(maxF(120.0, cfg.InactivityTimeout) * float64(time.Second)),
+		inactivityTimeout:    time.Duration(maxF(30.0, cfg.InactivityTimeout) * float64(time.Second)),
 		dataPacketTTL:        time.Duration(maxF(120.0, cfg.DataPacketTTL) * float64(time.Second)),
 		maxDataRetries:       maxI(60, cfg.MaxDataRetries),
 		terminalDrainTimeout: time.Duration(maxF(60.0, cfg.TerminalDrainTimeout) * float64(time.Second)),
@@ -985,6 +987,7 @@ func (a *ARQ) ioLoop() {
 			now := time.Now()
 			a.mu.Lock()
 			a.lastActivity = now
+			a.lastProgress = now
 			sn := a.sndNxt
 			a.sndNxt++
 			currentRTO := a.currentDataBaseRTO()
@@ -1426,6 +1429,7 @@ func (a *ARQ) processReceivedDataBatch(batch []rxPayload) {
 		oldWrap bool // old/wrapped sn — ACK but don't insert
 	}
 	results := make([]rxResult, len(batch))
+	progressed := false
 
 	for i, pkt := range batch {
 		sn := pkt.sn
@@ -1453,10 +1457,14 @@ func (a *ARQ) processReceivedDataBatch(batch []rxPayload) {
 		if !exists {
 			a.rcvBuf[sn] = pkt.data
 			results[i] = rxResult{sn: sn, ack: true, isNew: true}
+			progressed = true
 		} else {
 			// Duplicate — ACK it (sender may have retransmitted) but skip NACK work
 			results[i] = rxResult{sn: sn, ack: true}
 		}
+	}
+	if progressed {
+		a.lastProgress = now
 	}
 	a.mu.Unlock()
 
@@ -1606,6 +1614,9 @@ func (a *ARQ) writeLoop() {
 						a.writeLock.Unlock()
 						if n > 0 {
 							remaining = remaining[n:]
+							a.mu.Lock()
+							a.lastProgress = time.Now()
+							a.mu.Unlock()
 						}
 						if err == nil {
 							continue
@@ -1703,6 +1714,7 @@ func (a *ARQ) ReceiveAck(packetType uint8, sn uint16) bool {
 			sampleEligible = true
 		}
 		delete(a.sndBuf, sn)
+		a.lastProgress = now
 		if len(a.sndBuf) < a.limit {
 			shouldSignalWindow = true
 		}
@@ -2058,6 +2070,7 @@ func (a *ARQ) ReceiveControlAck(ackPacketType uint8, sequenceNum uint16, fragmen
 		a.mu.Unlock()
 		return false
 	}
+	a.lastProgress = now
 
 	if tracked {
 		if info != nil && info.SampleEligible && info.Dispatched && !info.LastSentAt.IsZero() {
@@ -2330,12 +2343,12 @@ func (a *ARQ) handleTerminalRetransmitState(now time.Time) bool {
 		return false
 	}
 
-	if now.Sub(a.lastActivity) > a.inactivityTimeout {
+	if now.Sub(a.lastProgress) > a.inactivityTimeout {
 		hasPending := len(a.sndBuf) > 0 || (a.enableControlReliability && len(a.controlSndBuf) > 0)
 		if hasPending {
-			a.lastActivity = now
 			a.mu.Unlock()
-			return false
+			a.Close("Stream No Progress Timeout (Pending)", CloseOptions{SendRST: true})
+			return true
 		}
 
 		a.mu.Unlock()
