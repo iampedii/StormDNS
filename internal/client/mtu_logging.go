@@ -64,7 +64,7 @@ func (c *Client) logMTUProgress(counters *mtuScanCounters, total int) {
 	}
 	completed := int(counters.completed.Load())
 	valid := int(counters.valid.Load())
-	rejected := int(counters.rejectUpload.Load() + counters.rejectDownload.Load())
+	rejected := int(counters.rejectUpload.Load() + counters.rejectDownload.Load() + counters.rejectSession.Load())
 	percent := 10
 	if total > 0 {
 		percent += (70 * completed) / total

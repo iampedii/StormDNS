@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -70,6 +70,7 @@ func promptStartupMode(preConfig config.ClientStartupPreConfig) bool {
 func main() {
 	configPath := flag.String("config", "client_config.toml", "Path to client configuration file")
 	resolversPath := flag.String("resolvers", "", "Path to resolver file override (optional)")
+	scanOnly := flag.Bool("scan-only", false, "Scan resolvers and exit without starting local listeners")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	configFlags, err := config.NewClientConfigFlagBinder(flag.CommandLine)
 	if err != nil {
@@ -93,7 +94,10 @@ func main() {
 	// Peek at startup-mode fields before loading the full config so we can
 	// present the prompt without side-effects.
 	preConfig := config.PeekClientStartupConfig(resolvedConfigPath)
-	fromLogs := promptStartupMode(preConfig)
+	fromLogs := false
+	if !*scanOnly {
+		fromLogs = promptStartupMode(preConfig)
+	}
 
 	var app *client.Client
 	if fromLogs {
@@ -114,8 +118,20 @@ func main() {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
-		waitForExitInput()
+		if !*scanOnly {
+			waitForExitInput()
+		}
 		os.Exit(1)
+	}
+
+	if *scanOnly {
+		sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if _, err := app.RunResolverScan(sigCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "Resolver scan failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	app.PrintBanner()

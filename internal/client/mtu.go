@@ -50,6 +50,7 @@ const (
 	mtuRejectNone mtuRejectReason = iota
 	mtuRejectUpload
 	mtuRejectDownload
+	mtuRejectSession
 )
 
 type mtuProbeOptions struct {
@@ -69,6 +70,7 @@ type mtuScanCounters struct {
 	valid          atomic.Int32
 	rejectUpload   atomic.Int32
 	rejectDownload atomic.Int32
+	rejectSession  atomic.Int32
 }
 
 type mtuScanResult struct {
@@ -96,7 +98,7 @@ func (c *Client) runFullMTUTests(ctx context.Context) error {
 
 	counters := &mtuScanCounters{}
 	c.logMTUProgress(counters, len(c.connections))
-	c.runAllMTUProbeWorkers(ctx, uploadCaps, workerCount, counters, nil)
+	c.runAllMTUProbeWorkers(ctx, uploadCaps, workerCount, counters, nil, nil)
 
 	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
 	if len(validConns) == 0 {
@@ -328,8 +330,16 @@ func (c *Client) activateBackgroundMTUConnection(conn Connection) {
 
 // runAllMTUProbeWorkers dispatches MTU probe jobs to workers. When onValid is
 // non-nil it is called (with a copy of the connection) after each successful
-// probe, from within the worker goroutine.
-func (c *Client) runAllMTUProbeWorkers(ctx context.Context, uploadCaps map[string]int, workerCount int, counters *mtuScanCounters, onValid func(Connection)) {
+// probe, from within the worker goroutine. When onRejected is non-nil it is
+// called after a completed rejected probe while the context is still active.
+func (c *Client) runAllMTUProbeWorkers(
+	ctx context.Context,
+	uploadCaps map[string]int,
+	workerCount int,
+	counters *mtuScanCounters,
+	onValid func(Connection),
+	onRejected func(Connection),
+) {
 	total := len(c.connections)
 	if workerCount <= 1 {
 		for idx := range c.connections {
@@ -340,6 +350,8 @@ func (c *Client) runAllMTUProbeWorkers(ctx context.Context, uploadCaps map[strin
 			c.runConnectionMTUTest(ctx, conn, idx+1, total, uploadCaps[conn.Domain], counters)
 			if onValid != nil && conn.IsValid {
 				onValid(*conn)
+			} else if onRejected != nil && !conn.IsValid && ctx.Err() == nil {
+				onRejected(*conn)
 			}
 		}
 		return
@@ -359,6 +371,8 @@ func (c *Client) runAllMTUProbeWorkers(ctx context.Context, uploadCaps map[strin
 				c.runConnectionMTUTest(ctx, conn, idx+1, total, uploadCaps[conn.Domain], counters)
 				if onValid != nil && conn.IsValid {
 					onValid(*conn)
+				} else if onRejected != nil && !conn.IsValid && ctx.Err() == nil {
+					onRejected(*conn)
 				}
 			}
 		}()
@@ -409,7 +423,8 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 			}
 			if counters != nil {
 				completed := counters.completed.Add(1)
-				rejectedNow := counters.rejectUpload.Add(1) + counters.rejectDownload.Load()
+				counters.rejectUpload.Add(1)
+				rejectedNow := c.totalRejectedMTU(counters)
 				if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 					c.log.Warnf(
 						"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>PANIC</yellow> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
@@ -444,7 +459,8 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 	switch reason {
 	case mtuRejectUpload:
 		completed := counters.completed.Add(1)
-		rejectedNow := counters.rejectUpload.Add(1) + counters.rejectDownload.Load()
+		counters.rejectUpload.Add(1)
+		rejectedNow := c.totalRejectedMTU(counters)
 		if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 			c.log.Warnf(
 				"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>UPLOAD_MTU</yellow> | value=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
@@ -461,7 +477,8 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 		return
 	case mtuRejectDownload:
 		completed := counters.completed.Add(1)
-		rejectedNow := counters.rejectUpload.Load() + counters.rejectDownload.Add(1)
+		counters.rejectDownload.Add(1)
+		rejectedNow := c.totalRejectedMTU(counters)
 		if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 			c.log.Warnf(
 				"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>DOWNLOAD_MTU</yellow> | value=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
@@ -478,6 +495,14 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 		return
 	}
 
+	c.acceptConnectionMTUProbe(conn, result, counters, total)
+}
+
+func (c *Client) acceptConnectionMTUProbe(conn *Connection, result mtuConnectionProbeResult, counters *mtuScanCounters, total int) {
+	if conn == nil || counters == nil {
+		return
+	}
+
 	conn.IsValid = true
 	conn.UploadMTUBytes = result.UploadBytes
 	conn.UploadMTUChars = result.UploadChars
@@ -486,10 +511,10 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 
 	completed := counters.completed.Add(1)
 	validNow := counters.valid.Add(1)
-	rejectedNow := counters.rejectUpload.Load() + counters.rejectDownload.Load()
-	if c.log != nil && c.log.Enabled(logger.LevelInfo) {
-		c.log.Infof(
-			"<green>✅ Accepted (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | upload=<cyan>%d</cyan> | download=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></green>",
+	rejectedNow := c.totalRejectedMTU(counters)
+	if c.log != nil && c.log.Enabled(logger.LevelWarn) {
+		format := "<green>✅ Accepted (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | upload=<cyan>%d</cyan> | download=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></green>"
+		args := []any{
 			completed,
 			total,
 			conn.Domain,
@@ -498,7 +523,12 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 			conn.DownloadMTUBytes,
 			validNow,
 			rejectedNow,
-		)
+		}
+		if c.log.Enabled(logger.LevelInfo) {
+			c.log.Infof(format, args...)
+		} else {
+			c.log.Machinef(format, args...)
+		}
 	}
 	c.logMTUProgress(counters, total)
 	c.appendResolverCacheEntry(conn)
@@ -513,6 +543,18 @@ func (c *Client) probeConnectionMTU(ctx context.Context, conn *Connection, maxUp
 		return result, mtuRejectUpload
 	}
 	defer probeTransport.conn.Close()
+
+	return c.probeConnectionMTUWithTransport(ctx, conn, probeTransport, maxUploadPayload)
+}
+
+func (c *Client) probeConnectionMTUWithTransport(ctx context.Context, conn *Connection, probeTransport *udpQueryTransport, maxUploadPayload int) (mtuConnectionProbeResult, mtuRejectReason) {
+	var result mtuConnectionProbeResult
+	if probeTransport == nil || probeTransport.conn == nil {
+		if conn != nil {
+			conn.IsValid = false
+		}
+		return result, mtuRejectUpload
+	}
 
 	upOK, upBytes, upChars, upRTT, err := c.testUploadMTU(ctx, conn, probeTransport, maxUploadPayload)
 	if err != nil || !upOK {
@@ -533,6 +575,13 @@ func (c *Client) probeConnectionMTU(ctx context.Context, conn *Connection, maxUp
 	result.DownloadBytes = downBytes
 	result.ResolveTime = averageMTUProbeRTT(upRTT, downRTT)
 	return result, mtuRejectNone
+}
+
+func (c *Client) totalRejectedMTU(counters *mtuScanCounters) int32 {
+	if counters == nil {
+		return 0
+	}
+	return counters.rejectUpload.Load() + counters.rejectDownload.Load() + counters.rejectSession.Load()
 }
 
 func (c *Client) precomputeUploadCaps() map[string]int {
