@@ -20,6 +20,14 @@ import (
 var errLateStreamResult = errors.New("late stream result for closed or terminal local stream")
 
 func (c *Client) HandleTCPConnect(_ context.Context, conn net.Conn) {
+	if ok, reason := c.shouldAdmitNewLocalStream(c.now()); !ok {
+		c.logNewStreamRejected(reason)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
+
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		if conn != nil {
@@ -53,7 +61,7 @@ func (c *Client) HandleTCPConnect(_ context.Context, conn net.Conn) {
 		Enums.DefaultPacketPriority(Enums.PACKET_STREAM_SYN),
 		true,
 		nil,
-		120*time.Second,
+		c.streamSetupTTL(),
 	)
 }
 

@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -11,12 +11,14 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"sync"
 	"time"
 
 	"stormdns-go/internal/compression"
+	DnsParser "stormdns-go/internal/dnsparser"
 	Enums "stormdns-go/internal/enums"
 	VpnProto "stormdns-go/internal/vpnproto"
 )
@@ -55,49 +57,68 @@ func (c *Client) InitializeSession(maxAttempts int) error {
 }
 
 func (c *Client) initializeSessionOnce() error {
-	conn, initPayload, verifyCode, err := c.nextSessionInitAttempt()
+	attempts, err := c.nextSessionInitAttempts(c.sessionInitFanoutCount())
 	if err != nil {
 		return err
 	}
 
-	query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, initPayload)
-	if err != nil {
-		return ErrSessionInitFailed
+	type sessionInitResult struct {
+		packet VpnProto.Packet
+		err    error
 	}
 
-	packet, err := c.exchangeDNSOverConnection(conn, query, c.mtuTestTimeout*3)
-	if err != nil {
-		return ErrSessionInitFailed
+	results := make(chan sessionInitResult, len(attempts))
+	for _, attempt := range attempts {
+		attempt := attempt
+		go func() {
+			query, err := c.buildSessionQuery(attempt.conn.Domain, Enums.PACKET_SESSION_INIT, attempt.payload)
+			if err != nil {
+				results <- sessionInitResult{err: ErrSessionInitFailed}
+				return
+			}
+			packet, err := c.exchangeDNSOverConnection(attempt.conn, query, c.mtuTestTimeout*3)
+			if err != nil {
+				results <- sessionInitResult{err: ErrSessionInitFailed}
+				return
+			}
+			results <- sessionInitResult{packet: packet}
+		}()
 	}
 
-	switch packet.PacketType {
-	case Enums.PACKET_SESSION_BUSY:
-		if len(packet.Payload) < sessionBusyPayloadSize || !bytes.Equal(packet.Payload[:sessionBusyPayloadSize], verifyCode[:]) {
-			return ErrSessionInitFailed
+	sawBusy := false
+	for range attempts {
+		result := <-results
+		if result.err != nil {
+			continue
 		}
+		err := c.applySessionInitResponse(result.packet, attempts[0].payload, attempts[0].verifyCode)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrSessionInitBusy) {
+			sawBusy = true
+		}
+	}
+
+	if sawBusy {
 		c.setSessionInitBusyUntil(time.Now().Add(c.cfg.SessionInitBusyRetryInterval()))
 		return ErrSessionInitBusy
-	case Enums.PACKET_SESSION_ACCEPT:
-		if len(packet.Payload) < sessionAcceptPayloadSize || !bytes.Equal(packet.Payload[3:7], verifyCode[:]) {
-			return ErrSessionInitFailed
-		}
-
-		c.sessionID = packet.Payload[0]
-		c.sessionCookie = packet.Payload[1]
-		c.responseMode = initPayload[0]
-		c.uploadCompression, c.downloadCompression = compression.SplitPair(packet.Payload[2])
-		c.sessionReady = true
-		c.applySessionCompressionPolicy()
-		c.clearSessionInitBusyUntil()
-		c.resetSessionInitState()
-		c.clearSessionResetPending()
-		return nil
-	default:
-		return ErrSessionInitFailed
 	}
+
+	return ErrSessionInitFailed
+}
+
+type sessionInitAttempt struct {
+	conn       Connection
+	payload    []byte
+	verifyCode [4]byte
 }
 
 func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
+	return c.buildSessionInitPayloadForMTU(c.syncedUploadMTU, c.syncedDownloadMTU)
+}
+
+func (c *Client) buildSessionInitPayloadForMTU(uploadMTU int, downloadMTU int) ([]byte, bool, [4]byte, error) {
 	var verifyCode [4]byte
 	randomPart, err := randomBytes(len(verifyCode))
 	if err != nil {
@@ -110,16 +131,42 @@ func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
 		payload[0] = mtuProbeBase64Reply
 	}
 	payload[1] = compression.PackPair(c.uploadCompression, c.downloadCompression)
-	binary.BigEndian.PutUint16(payload[2:4], uint16(c.syncedUploadMTU))
-	binary.BigEndian.PutUint16(payload[4:6], uint16(c.syncedDownloadMTU))
+	binary.BigEndian.PutUint16(payload[2:4], uint16(uploadMTU))
+	binary.BigEndian.PutUint16(payload[4:6], uint16(downloadMTU))
 	copy(payload[6:10], verifyCode[:])
 	return payload, payload[0] == mtuProbeBase64Reply, verifyCode, nil
 }
 
 func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 	var empty [4]byte
+	attempts, err := c.nextSessionInitAttempts(1)
+	if err != nil {
+		return Connection{}, nil, empty, err
+	}
+	return attempts[0].conn, attempts[0].payload, attempts[0].verifyCode, nil
+}
+
+func (c *Client) sessionInitFanoutCount() int {
 	if c == nil {
-		return Connection{}, nil, empty, ErrSessionInitFailed
+		return 1
+	}
+	_, _, uploadSetup, downloadSetup := c.directionalDuplicationCounts()
+	fanout := uploadSetup
+	if downloadSetup > fanout {
+		fanout = downloadSetup
+	}
+	if fanout < 2 {
+		fanout = 2
+	}
+	return min(fanout, 8)
+}
+
+func (c *Client) nextSessionInitAttempts(maxTargets int) ([]sessionInitAttempt, error) {
+	if c == nil {
+		return nil, ErrSessionInitFailed
+	}
+	if maxTargets < 1 {
+		maxTargets = 1
 	}
 
 	c.initStateMu.Lock()
@@ -129,7 +176,7 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 	if !c.sessionInitReady {
 		payload, responseBase64, verifyCode, err := c.buildSessionInitPayload()
 		if err != nil {
-			return Connection{}, nil, empty, err
+			return nil, err
 		}
 		c.sessionInitPayload = payload
 		c.sessionInitBase64 = responseBase64
@@ -140,12 +187,17 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 
 	snap := c.balancer.snapshot.Load()
 	if snap == nil || len(snap.valid) == 0 {
-		return Connection{}, nil, empty, ErrNoValidConnections
+		return nil, ErrNoValidConnections
 	}
 
 	// Use the cursor to rotate between valid resolvers in a Round-Robin fashion
 	validLen := len(snap.valid)
+	if maxTargets > validLen {
+		maxTargets = validLen
+	}
+	attempts := make([]sessionInitAttempt, 0, maxTargets)
 	start := c.sessionInitCursor
+	lastIdxInValid := start
 	for checked := 0; checked < validLen; checked++ {
 		idxInValid := (start + checked) % validLen
 		connIdx := snap.valid[idxInValid]
@@ -154,12 +206,146 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 		if !ok {
 			continue
 		}
+		if c.isRuntimeDisabledResolver(conn.Key) {
+			continue
+		}
 
-		c.sessionInitCursor = (idxInValid + 1) % validLen
-		return conn, c.sessionInitPayload, c.sessionInitVerify, nil
+		attempts = append(attempts, sessionInitAttempt{
+			conn:       conn,
+			payload:    c.sessionInitPayload,
+			verifyCode: c.sessionInitVerify,
+		})
+		lastIdxInValid = idxInValid
+		if len(attempts) >= maxTargets {
+			break
+		}
 	}
 
-	return Connection{}, nil, empty, ErrNoValidConnections
+	if len(attempts) == 0 {
+		for checked := 0; checked < validLen && len(attempts) < maxTargets; checked++ {
+			idxInValid := (start + checked) % validLen
+			connIdx := snap.valid[idxInValid]
+
+			conn, ok := derefConnection(snap.connections, connIdx)
+			if !ok {
+				continue
+			}
+
+			attempts = append(attempts, sessionInitAttempt{
+				conn:       conn,
+				payload:    c.sessionInitPayload,
+				verifyCode: c.sessionInitVerify,
+			})
+			lastIdxInValid = idxInValid
+		}
+	}
+
+	if len(attempts) == 0 {
+		return nil, ErrNoValidConnections
+	}
+
+	c.sessionInitCursor = (lastIdxInValid + 1) % validLen
+	return attempts, nil
+}
+
+func (c *Client) applySessionInitResponse(packet VpnProto.Packet, initPayload []byte, verifyCode [4]byte) error {
+	switch packet.PacketType {
+	case Enums.PACKET_SESSION_BUSY:
+		if !verifySessionBusyPacket(packet, verifyCode) {
+			return ErrSessionInitFailed
+		}
+		return ErrSessionInitBusy
+	case Enums.PACKET_SESSION_ACCEPT:
+		sessionID, sessionCookie, compressionPair, ok := verifySessionAcceptPacket(packet, verifyCode)
+		if !ok {
+			return ErrSessionInitFailed
+		}
+
+		c.sessionID = sessionID
+		c.sessionCookie = sessionCookie
+		c.responseMode = initPayload[0]
+		c.uploadCompression, c.downloadCompression = compression.SplitPair(compressionPair)
+		c.sessionReady = true
+		c.applySessionCompressionPolicy()
+		c.clearSessionInitBusyUntil()
+		c.resetSessionInitState()
+		c.clearSessionResetPending()
+		return nil
+	default:
+		return ErrSessionInitFailed
+	}
+}
+
+func verifySessionBusyPacket(packet VpnProto.Packet, verifyCode [4]byte) bool {
+	return packet.PacketType == Enums.PACKET_SESSION_BUSY &&
+		len(packet.Payload) >= sessionBusyPayloadSize &&
+		bytes.Equal(packet.Payload[:sessionBusyPayloadSize], verifyCode[:])
+}
+
+func verifySessionAcceptPacket(packet VpnProto.Packet, verifyCode [4]byte) (uint8, uint8, uint8, bool) {
+	if packet.PacketType != Enums.PACKET_SESSION_ACCEPT ||
+		len(packet.Payload) < sessionAcceptPayloadSize ||
+		!bytes.Equal(packet.Payload[3:7], verifyCode[:]) {
+		return 0, 0, 0, false
+	}
+	return packet.Payload[0], packet.Payload[1], packet.Payload[2], true
+}
+
+func (c *Client) verifyResolverSessionInit(ctx context.Context, conn *Connection, transport *udpQueryTransport, mtuResult mtuConnectionProbeResult) bool {
+	if c == nil || conn == nil || transport == nil || transport.conn == nil {
+		return false
+	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+
+	payload, responseBase64, verifyCode, err := c.buildSessionInitPayloadForMTU(mtuResult.UploadBytes, mtuResult.DownloadBytes)
+	if err != nil {
+		return false
+	}
+
+	query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, payload)
+	if err != nil {
+		return false
+	}
+
+	response, err := c.exchangeUDPQuery(transport, query, normalizeTimeout(c.mtuTestTimeout*3, time.Second))
+	if err != nil {
+		return false
+	}
+
+	packet, err := DnsParser.ExtractVPNResponse(response, responseBase64)
+	if err != nil {
+		return false
+	}
+
+	sessionID, sessionCookie, _, ok := verifySessionAcceptPacket(packet, verifyCode)
+	if !ok {
+		return false
+	}
+
+	c.sendSessionCloseViaTransport(*conn, transport, sessionID, sessionCookie)
+	return true
+}
+
+func (c *Client) sendSessionCloseViaTransport(conn Connection, transport *udpQueryTransport, sessionID uint8, sessionCookie uint8) {
+	if c == nil || transport == nil || transport.conn == nil || sessionID == 0 {
+		return
+	}
+
+	query, err := c.buildTunnelTXTQueryRaw(conn.Domain, VpnProto.BuildOptions{
+		SessionID:     sessionID,
+		SessionCookie: sessionCookie,
+		PacketType:    Enums.PACKET_SESSION_CLOSE,
+	})
+	if err != nil {
+		return
+	}
+
+	if err := transport.conn.SetWriteDeadline(time.Now().Add(normalizeTimeout(c.mtuTestTimeout, time.Second))); err != nil {
+		return
+	}
+	_, _ = transport.conn.Write(query)
 }
 
 func (c *Client) resetSessionInitState() {

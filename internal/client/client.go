@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -40,23 +40,27 @@ type Client struct {
 	codec    *security.Codec
 	balancer *Balancer
 
-	connections         []Connection
-	connectionsByKey    map[string]int
-	successMTUChecks    bool
-	udpBufferPool       sync.Pool
-	resolverConnsMu     sync.Mutex
-	resolverConns       map[string]chan pooledUDPConn
-	resolverAddrMu      sync.RWMutex
-	resolverAddrCache   map[string]*net.UDPAddr
-	resolverStatsMu     sync.RWMutex
-	resolverPending     map[resolverSampleKey]resolverSample
-	resolverHealthMu    sync.RWMutex
-	resolverHealth      map[string]*resolverHealthState
-	resolverRecheck     map[string]resolverRecheckState
-	runtimeDisabled     map[string]resolverDisabledState
-	resolverRecheckSem  chan struct{}
-	nowFn               func() time.Time
-	recheckConnectionFn func(conn *Connection) bool
+	connections              []Connection
+	connectionsByKey         map[string]int
+	preparedDomains          map[string]preparedTunnelDomain
+	successMTUChecks         bool
+	udpBufferPool            sync.Pool
+	resolverConnsMu          sync.Mutex
+	resolverConns            map[string]chan pooledUDPConn
+	resolverAddrMu           sync.RWMutex
+	resolverAddrCache        map[string]*net.UDPAddr
+	resolverStatsMu          sync.RWMutex
+	resolverPending          map[resolverSampleKey]resolverSample
+	resolverHealthMu         sync.RWMutex
+	resolverHealth           map[string]*resolverHealthState
+	resolverRecheck          map[string]resolverRecheckState
+	runtimeDisabled          map[string]resolverDisabledState
+	resolverRecheckSem       chan struct{}
+	resolverRuntimeLogMu     sync.Mutex
+	lastResolverRuntimeLog   string
+	lastResolverRuntimeLogAt time.Time
+	nowFn                    func() time.Time
+	recheckConnectionFn      func(conn *Connection) bool
 
 	// MTU States
 	syncedUploadMTU                       int
@@ -100,8 +104,11 @@ type Client struct {
 	lastRXDropLogUnix   atomic.Int64
 
 	// Traffic byte counters (per-session, reset on resetRuntimeBindings)
-	txTotalBytes atomic.Uint64
-	rxTotalBytes atomic.Uint64
+	txTotalBytes                     atomic.Uint64
+	rxTotalBytes                     atomic.Uint64
+	lastTunnelSendUnix               atomic.Int64
+	lastTunnelResponseUnix           atomic.Int64
+	lastStreamAdmissionRejectLogUnix atomic.Int64
 
 	// Async Runtime Workers & Channels
 	asyncWG              sync.WaitGroup
@@ -282,6 +289,7 @@ func BootstrapFromLogs(configPath string, entries []ResolverCacheEntry, override
 	mtuLookup := buildResolverCacheMTULookup(entries)
 	for i := range c.connections {
 		conn := &c.connections[i]
+		c.prepareConnectionMTUScanState(conn)
 		key := makeConnectionKey(conn.Resolver, conn.ResolverPort, conn.Domain)
 		if e, ok := mtuLookup[key]; ok && e.UploadMTU > 0 && e.DownloadMTU > 0 {
 			conn.IsValid = true
@@ -329,6 +337,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		maxPackedBlocks:     1,
 		responseMode:        responseMode,
 		connectionsByKey:    make(map[string]int, len(cfg.Domains)*len(cfg.Resolvers)),
+		preparedDomains:     prepareTunnelDomains(cfg.Domains),
 		udpBufferPool: sync.Pool{
 			New: func() any {
 				return make([]byte, RuntimeUDPReadBufferSize)
@@ -406,6 +415,7 @@ func (c *Client) nextSessionInitRetryDelay(failures int) time.Duration {
 func (c *Client) Run(ctx context.Context) error {
 	c.successMTUChecks = false
 	c.log.Infof("\U0001F504 <cyan>Starting main runtime loop...</cyan>")
+	c.logConnectionProgress("starting", 5)
 	sessionInitRetryDelay := time.Duration(0)
 	sessionInitRetryFailures := 0
 
@@ -444,6 +454,7 @@ func (c *Client) Run(ctx context.Context) error {
 
 				if mtuErr != nil {
 					c.log.Errorf("<red>MTU tests failed: %v</red>", mtuErr)
+					c.logConnectionProgress("retry", 10)
 					c.successMTUChecks = false
 					select {
 					case <-ctx.Done():
@@ -458,6 +469,7 @@ func (c *Client) Run(ctx context.Context) error {
 				if c.syncedUploadMTU <= 0 || c.syncedDownloadMTU <= 0 {
 					c.successMTUChecks = false
 					c.log.Errorf("<red>❌ MTU tests failed: Upload MTU: %d, Download MTU: %d</red>", c.syncedUploadMTU, c.syncedDownloadMTU)
+					c.logConnectionProgress("retry", 10)
 					select {
 					case <-ctx.Done():
 						c.notifySessionCloseBurst(time.Second)
@@ -478,10 +490,12 @@ func (c *Client) Run(ctx context.Context) error {
 					retries = 3
 				}
 
+				c.logConnectionProgress("session", 90, "attempt", sessionInitRetryFailures+1)
 				if err := c.InitializeSession(retries); err != nil {
 					sessionInitRetryFailures++
 					sessionInitRetryDelay = c.nextSessionInitRetryDelay(sessionInitRetryFailures)
 					c.log.Errorf("<red>❌ Session initialization failed: %v</red>", err)
+					c.logConnectionProgress("retry", 90, "attempt", sessionInitRetryFailures)
 					c.log.Warnf("<yellow>Session init retry backoff: %s</yellow>", sessionInitRetryDelay)
 					select {
 					case <-ctx.Done():
@@ -493,6 +507,7 @@ func (c *Client) Run(ctx context.Context) error {
 					continue
 				}
 				c.log.Infof("<green>✅ Session Initialized Successfully (ID: <cyan>%d</cyan>)</green>", c.sessionID)
+				c.logConnectionProgress("runtime", 98)
 
 				sessionInitRetryFailures = 0
 				sessionInitRetryDelay = 0

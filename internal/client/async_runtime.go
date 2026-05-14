@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -90,6 +90,7 @@ func (c *Client) resetRuntimeBindings(resetSession bool) {
 	c.clearSessionResetPending()
 	c.txTotalBytes.Store(0)
 	c.rxTotalBytes.Store(0)
+	c.clearTunnelActivity()
 	if resetSession {
 		c.resetSessionState(true)
 	}
@@ -264,6 +265,7 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	}
 
 	c.tunnelConns = conns
+	c.resetTunnelActivity(c.now())
 
 	c.log.Infof("\U0001F4E1 <cyan>Async Runtime Initialized: <green>%d RX/TX Workers</green>, <green>%d Processors</green></cyan>",
 		c.tunnelRX_TX_Workers, c.tunnelProcessWorkers)
@@ -483,7 +485,6 @@ func (c *Client) asyncEncodeWorker(ctx context.Context, id int) {
 	}
 
 	var packetByDomain map[string][]byte
-	var preparedDomainByName map[string]preparedTunnelDomain
 	var frames []encodedOutboundDatagram
 	for {
 		select {
@@ -517,9 +518,6 @@ func (c *Client) asyncEncodeWorker(ctx context.Context, id int) {
 			if packetByDomain != nil {
 				clear(packetByDomain)
 			}
-			if preparedDomainByName != nil {
-				clear(preparedDomainByName)
-			}
 			frames = frames[:0]
 
 			for _, resolverConn := range task.conns {
@@ -533,16 +531,9 @@ func (c *Client) asyncEncodeWorker(ctx context.Context, id int) {
 					continue
 				}
 
-				prepared, cachedPrepared := preparedDomainByName[domain]
-				if !cachedPrepared {
-					prepared, err = prepareTunnelDomain(domain)
-					if err != nil {
-						continue
-					}
-					if preparedDomainByName == nil {
-						preparedDomainByName = make(map[string]preparedTunnelDomain, len(task.conns))
-					}
-					preparedDomainByName[domain] = prepared
+				prepared, err := c.preparedTunnelDomainFor(domain)
+				if err != nil {
+					continue
 				}
 
 				var dnsPacket []byte
@@ -637,6 +628,7 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 					continue
 				}
 				if _, err := conn.WriteToUDP(frame.packet, frame.addr); err == nil {
+					c.recordTunnelSend(now)
 					c.trackResolverSend(frame.packet, frame.addr.String(), localAddr, frame.serverKey, now)
 					c.txTotalBytes.Add(uint64(len(frame.packet)))
 				}
@@ -725,12 +717,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 	vpnPacket, err := DnsParser.ExtractVPNResponse(data, c.responseMode == mtuProbeBase64Reply)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrTXTAnswerMissing) {
-			receivedAt := time.Now()
-			if parsed, parseErr := DnsParser.ParsePacketLite(data); parseErr == nil && parsed.Header.RCode != 0 {
-				c.trackResolverFailure(data, addr, localAddr, receivedAt)
-			} else {
-				c.trackResolverSuccess(data, addr, localAddr, receivedAt)
-			}
+			c.trackResolverFailure(data, addr, localAddr, time.Now())
 			// summary := DnsParser.DescribeResponseWithoutTunnelPayload(data)
 			// c.log.Debugf("DNS response from %v had no tunnel TXT payload | %s", addr, summary)
 			return

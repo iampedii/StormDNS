@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -76,6 +76,9 @@ func (c *Client) HandleSOCKS5(ctx context.Context, conn net.Conn) {
 		}
 	}
 
+	clearHandshakeDeadline := c.applyLocalHandshakeDeadline(conn)
+	defer clearHandshakeDeadline()
+
 	version := make([]byte, 1)
 	if _, err := io.ReadFull(conn, version); err != nil {
 		_ = conn.Close()
@@ -84,19 +87,38 @@ func (c *Client) HandleSOCKS5(ctx context.Context, conn net.Conn) {
 
 	switch version[0] {
 	case SOCKS5_VERSION:
-		c.handleSOCKS5Request(ctx, conn)
+		c.handleSOCKS5Request(ctx, conn, clearHandshakeDeadline)
 	case SOCKS4_VERSION:
 		if !c.supportsSOCKS4() {
 			_ = conn.Close()
 			return
 		}
-		c.handleSOCKS4Request(ctx, conn)
+		c.handleSOCKS4Request(ctx, conn, clearHandshakeDeadline)
 	default:
 		_ = conn.Close()
 	}
 }
 
-func (c *Client) handleSOCKS5Request(ctx context.Context, conn net.Conn) {
+func (c *Client) applyLocalHandshakeDeadline(conn net.Conn) func() {
+	if c == nil || conn == nil {
+		return func() {}
+	}
+	timeout := c.cfg.LocalHandshakeTimeout()
+	if timeout <= 0 {
+		return func() {}
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	cleared := false
+	return func() {
+		if cleared {
+			return
+		}
+		cleared = true
+		_ = conn.SetDeadline(time.Time{})
+	}
+}
+
+func (c *Client) handleSOCKS5Request(ctx context.Context, conn net.Conn, clearHandshakeDeadline func()) {
 	header := make([]byte, 1)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		_ = conn.Close()
@@ -237,6 +259,9 @@ func (c *Client) handleSOCKS5Request(ctx context.Context, conn net.Conn) {
 		return
 	}
 	port := binary.BigEndian.Uint16(portBuf)
+	if clearHandshakeDeadline != nil {
+		clearHandshakeDeadline()
+	}
 
 	if cmd == SOCKS5_CMD_CONNECT {
 		c.handleSOCKSConnect(ctx, conn, addr, port, atyp, SOCKS5_VERSION)
@@ -252,7 +277,7 @@ func (c *Client) handleSOCKS5Request(ctx context.Context, conn net.Conn) {
 	_ = conn.Close()
 }
 
-func (c *Client) handleSOCKS4Request(ctx context.Context, conn net.Conn) {
+func (c *Client) handleSOCKS4Request(ctx context.Context, conn net.Conn, clearHandshakeDeadline func()) {
 	req := make([]byte, 7)
 	if _, err := io.ReadFull(conn, req); err != nil {
 		_ = conn.Close()
@@ -304,6 +329,9 @@ func (c *Client) handleSOCKS4Request(ctx context.Context, conn net.Conn) {
 		addr = string(domain)
 	}
 
+	if clearHandshakeDeadline != nil {
+		clearHandshakeDeadline()
+	}
 	c.handleSOCKSConnect(ctx, conn, addr, port, atyp, SOCKS4_VERSION)
 }
 
@@ -325,6 +353,17 @@ func readNullTerminatedSocksField(conn net.Conn) ([]byte, error) {
 }
 
 func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte) {
+	if ok, reason := c.shouldAdmitNewLocalStream(c.now()); !ok {
+		c.logNewStreamRejected(reason)
+		if socksVersion == SOCKS4_VERSION {
+			_ = c.sendSocks4Reply(conn, false)
+		} else {
+			_ = c.sendSocksReply(conn, SOCKS5_REPLY_NETWORK_UNREACHABLE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
+		}
+		_ = conn.Close()
+		return
+	}
+
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		c.log.Errorf("❌ <red>Failed to get new Stream ID for SOCKS CONNECT</red>")
@@ -399,6 +438,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 	fragments := fragmentPayload(targetPayload, c.syncedUploadMTU)
 	total := uint8(len(fragments))
 	sn := uint16(0)
+	setupTTL := c.streamSetupTTL()
 
 	for i, frag := range fragments {
 		arqObj.SendControlPacketWithTTL(
@@ -410,7 +450,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 			Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_SYN),
 			true,
 			nil,
-			120*time.Second,
+			setupTTL,
 		)
 	}
 }
@@ -552,12 +592,20 @@ func (c *Client) sendSocksReply(conn net.Conn, rep byte, atyp byte, bndAddr net.
 	reply := []byte{SOCKS5_VERSION, rep, 0x00, atyp}
 
 	if atyp == SOCKS5_ATYP_IPV4 {
-		reply = append(reply, bndAddr.To4()...)
+		ip4 := bndAddr.To4()
+		if ip4 == nil {
+			ip4 = net.IPv4(0, 0, 0, 0).To4()
+		}
+		reply = append(reply, ip4...)
 	} else if atyp == SOCKS5_ATYP_IPV6 {
-		reply = append(reply, bndAddr.To16()...)
+		ip6 := bndAddr.To16()
+		if ip6 == nil {
+			ip6 = net.IPv6zero
+		}
+		reply = append(reply, ip6...)
 	} else if atyp == SOCKS5_ATYP_DOMAIN {
 		reply[3] = SOCKS5_ATYP_IPV4
-		reply = append(reply, net.IPv4zero...)
+		reply = append(reply, net.IPv4(0, 0, 0, 0).To4()...)
 	}
 
 	pBuf := make([]byte, 2)
@@ -569,8 +617,9 @@ func (c *Client) sendSocksReply(conn net.Conn, rep byte, atyp byte, bndAddr net.
 
 func (c *Client) rejectSocksUDPAssociateUnsupportedTarget(conn net.Conn, targetAddr string, targetPort uint16) {
 	if c.log != nil {
-		c.log.Debugf("⚠️ <yellow>SOCKS5 UDP packet to unsupported target %s:%d rejected (Only DNS/53 allowed).</yellow>", targetAddr, targetPort)
+		c.log.Debugf("⚠️ <yellow>SOCKS5 UDP packet to unsupported target %s:%d rejected; closing UDP association to force client fallback (Only DNS/53 allowed).</yellow>", targetAddr, targetPort)
 	}
+	_ = conn.Close()
 }
 
 func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, clientAddr string, clientPort uint16, atyp byte) {
@@ -662,7 +711,7 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 
 		if targetPort != 53 {
 			c.rejectSocksUDPAssociateUnsupportedTarget(conn, targetAddr, targetPort)
-			continue
+			return
 		}
 
 		c.log.Infof("📡 <green>Received DNS Query from SOCKS5 UDP: <cyan>%d bytes</cyan>, Target: <cyan>%s:%d</cyan></green>", n-payloadOffset, targetAddr, targetPort)

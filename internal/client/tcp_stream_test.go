@@ -19,7 +19,7 @@ import (
 )
 
 func buildTCPTestClient() *Client {
-	return buildTestClientWithResolvers(config.ClientConfig{
+	c := buildTestClientWithResolvers(config.ClientConfig{
 		ProtocolType:                "TCP",
 		StreamQueueInitialCapacity:  32,
 		OrphanQueueInitialCapacity:  8,
@@ -29,6 +29,9 @@ func buildTCPTestClient() *Client {
 		ARQControlInitialRTOSeconds: 0.2,
 		ARQControlMaxRTOSeconds:     1.0,
 	}, "resolver-a")
+	c.sessionReady = true
+	c.resetTunnelActivity(time.Now())
+	return c
 }
 
 func TestHandleTCPConnectQueuesStreamSyn(t *testing.T) {
@@ -69,6 +72,10 @@ func TestHandleTCPConnectQueuesStreamSyn(t *testing.T) {
 
 	if len(packet.Payload) != 0 {
 		t.Fatalf("expected raw STREAM_SYN without payload, got %d payload bytes", len(packet.Payload))
+	}
+
+	if packet.TTL != c.streamSetupTTL() {
+		t.Fatalf("expected setup TTL %s, got %s", c.streamSetupTTL(), packet.TTL)
 	}
 }
 

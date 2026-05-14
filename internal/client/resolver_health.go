@@ -414,6 +414,7 @@ func (c *Client) disableResolverConnection(serverKey string, cause string) bool 
 			c.activeResolverCount(),
 		)
 	}
+	c.logResolverRuntimeState()
 	return true
 }
 
@@ -486,6 +487,7 @@ func (c *Client) reactivateResolverConnection(serverKey string) bool {
 			c.activeResolverCount(),
 		)
 	}
+	c.logResolverRuntimeState()
 	return true
 }
 
@@ -824,8 +826,16 @@ func (c *Client) isRuntimeDisabledResolver(serverKey string) bool {
 		return false
 	}
 	c.resolverHealthMu.RLock()
-	_, ok := c.runtimeDisabled[serverKey]
+	ok := c.isRuntimeDisabledResolverLocked(serverKey)
 	c.resolverHealthMu.RUnlock()
+	return ok
+}
+
+func (c *Client) isRuntimeDisabledResolverLocked(serverKey string) bool {
+	if c == nil || serverKey == "" {
+		return false
+	}
+	_, ok := c.runtimeDisabled[serverKey]
 	return ok
 }
 
