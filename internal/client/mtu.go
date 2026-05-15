@@ -30,7 +30,7 @@ const (
 	mtuProbeRawResponse = 0
 	mtuProbeBase64Reply = 1
 	defaultMTUMinFloor  = 10
-	defaultUploadMaxCap = 512
+	defaultUploadMaxCap = 1500
 )
 
 var (

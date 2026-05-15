@@ -192,6 +192,45 @@ ENCRYPTION_KEY = "secret"
 	}
 }
 
+func TestLoadClientConfigAllowsAutoTuneDuplicationRange(t *testing.T) {
+	dir := t.TempDir()
+
+	configPath := filepath.Join(dir, "client_config.toml")
+	resolversPath := filepath.Join(dir, "client_resolvers.txt")
+
+	if err := os.WriteFile(configPath, []byte(`
+PROTOCOL_TYPE = "SOCKS5"
+DOMAINS = ["v.domain.com"]
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY = "secret"
+UPLOAD_PACKET_DUPLICATION_COUNT = 15
+DOWNLOAD_PACKET_DUPLICATION_COUNT = 30
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	if err := os.WriteFile(resolversPath, []byte("8.8.8.8\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile resolvers failed: %v", err)
+	}
+
+	cfg, err := LoadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadClientConfig returned error: %v", err)
+	}
+
+	if cfg.UploadPacketDuplicationCount != 15 {
+		t.Fatalf("unexpected upload duplication: got=%d want=15", cfg.UploadPacketDuplicationCount)
+	}
+	if cfg.DownloadPacketDuplicationCount != 30 {
+		t.Fatalf("unexpected download duplication: got=%d want=30", cfg.DownloadPacketDuplicationCount)
+	}
+	if cfg.UploadSetupPacketDuplicationCount != 15 {
+		t.Fatalf("unexpected upload setup duplication: got=%d want=15", cfg.UploadSetupPacketDuplicationCount)
+	}
+	if cfg.DownloadSetupPacketDuplicationCount != 30 {
+		t.Fatalf("unexpected download setup duplication: got=%d want=30", cfg.DownloadSetupPacketDuplicationCount)
+	}
+}
+
 func TestLoadClientConfigAllowsUsernameOnlySocksAuth(t *testing.T) {
 	dir := t.TempDir()
 

@@ -404,14 +404,14 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 		return cfg, fmt.Errorf("invalid RESOLVER_BALANCING_STRATEGY: %d", cfg.ResolverBalancingStrategy)
 	}
 
-	cfg.UploadPacketDuplicationCount = clampInt(defaultIntBelow(cfg.UploadPacketDuplicationCount, 1, 3), 1, 8)
-	cfg.DownloadPacketDuplicationCount = clampInt(defaultIntBelow(cfg.DownloadPacketDuplicationCount, 1, 7), 1, 8)
+	cfg.UploadPacketDuplicationCount = clampInt(defaultIntBelow(cfg.UploadPacketDuplicationCount, 1, 3), 1, 30)
+	cfg.DownloadPacketDuplicationCount = clampInt(defaultIntBelow(cfg.DownloadPacketDuplicationCount, 1, 7), 1, 30)
 
 	// Setup duplication is clamped to be at least as high as the corresponding
 	// directional data duplication, so setup packets never underperform data
 	// packets in either direction.
-	cfg.UploadSetupPacketDuplicationCount = clampInt(defaultIntBelow(cfg.UploadSetupPacketDuplicationCount, 1, 4), cfg.UploadPacketDuplicationCount, 8)
-	cfg.DownloadSetupPacketDuplicationCount = clampInt(defaultIntBelow(cfg.DownloadSetupPacketDuplicationCount, 1, 8), cfg.DownloadPacketDuplicationCount, 8)
+	cfg.UploadSetupPacketDuplicationCount = clampInt(defaultIntBelow(cfg.UploadSetupPacketDuplicationCount, 1, 4), cfg.UploadPacketDuplicationCount, 30)
+	cfg.DownloadSetupPacketDuplicationCount = clampInt(defaultIntBelow(cfg.DownloadSetupPacketDuplicationCount, 1, 8), cfg.DownloadPacketDuplicationCount, 30)
 	cfg.StreamResolverFailoverResendThreshold = clampInt(defaultIntBelow(cfg.StreamResolverFailoverResendThreshold, 1, 1), 1, 128)
 	cfg.StreamResolverFailoverCooldownSec = clampFloat(defaultFloatAtMostZero(cfg.StreamResolverFailoverCooldownSec, 0.5), 0.1, 120.0)
 	cfg.RecheckInactiveIntervalSeconds = clampFloat(defaultFloatAtMostZero(cfg.RecheckInactiveIntervalSeconds, 30.0), 30.0, 86400.0)

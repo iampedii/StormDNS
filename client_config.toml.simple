@@ -141,20 +141,20 @@ RESOLVER_BALANCING_STRATEGY = 3
 #   DOWNLOAD_SETUP_PACKET_DUPLICATION_COUNT= 4 .. 8
 
 # Duplication for upload data packets (STREAM_DATA, STREAM_RESEND).
-# Clamped in code to [1, 8].
+# Clamped in code to [1, 30].
 UPLOAD_PACKET_DUPLICATION_COUNT = 3
 
 # Duplication for download-ACK packets (STREAM_DATA_ACK, STREAM_DATA_NACK).
-# Clamped in code to [1, 8].
+# Clamped in code to [1, 30].
 DOWNLOAD_PACKET_DUPLICATION_COUNT = 7
 
 # Duplication for upload setup packets (STREAM_SYN, SOCKS5_SYN).
-# Clamped in code to [UPLOAD_PACKET_DUPLICATION_COUNT, 8].
+# Clamped in code to [UPLOAD_PACKET_DUPLICATION_COUNT, 30].
 UPLOAD_SETUP_PACKET_DUPLICATION_COUNT = 4
 
 # Duplication for download setup / control packets
 # (PACKED_CONTROL_BLOCKS, STREAM_CLOSE_READ, STREAM_CLOSE_WRITE).
-# Clamped in code to [DOWNLOAD_PACKET_DUPLICATION_COUNT, 8].
+# Clamped in code to [DOWNLOAD_PACKET_DUPLICATION_COUNT, 30].
 DOWNLOAD_SETUP_PACKET_DUPLICATION_COUNT = 8
 
 # Stream-aware resolver failover.
