@@ -533,13 +533,40 @@ disable_legacy_services() {
   fi
 }
 
+systemd_unit_exists() {
+  local unit="$1"
+  systemctl list-unit-files --all "${unit}" 2>/dev/null | awk '{print $1}' | grep -Fxq "${unit}"
+}
+
+detect_docker_systemd_unit() {
+  local unit
+  for unit in docker.service snap.docker.dockerd.service podman.service containerd.service; do
+    if systemd_unit_exists "${unit}"; then
+      printf '%s\n' "${unit}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 write_proxy_unit() {
   local backends="$1"
+  local docker_unit after_line requires_line
+  docker_unit="$(detect_docker_systemd_unit || true)"
+  after_line="After=network.target"
+  requires_line=""
+  if [[ -n "${docker_unit}" ]]; then
+    after_line="After=network.target ${docker_unit}"
+    requires_line="Requires=${docker_unit}"
+  else
+    log "No Docker systemd unit found; writing proxy unit without a Docker service dependency"
+  fi
+
   cat > "${PROXY_UNIT}" <<EOF
 [Unit]
 Description=StormDNS aware UDP frontend
-After=network.target docker.service
-Requires=docker.service
+${after_line}
+${requires_line}
 
 [Service]
 Type=simple
