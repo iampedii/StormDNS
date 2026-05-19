@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -334,6 +334,7 @@ func (s *Server) Run(ctx context.Context) error {
 	)
 
 	reqCh := make(chan request, s.cfg.MaxConcurrentRequests)
+	fatalErrCh := make(chan error, 1)
 	var workerWG sync.WaitGroup
 	cleanupDone := make(chan struct{})
 
@@ -345,6 +346,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.deferredDNSSession.Start(runCtx)
 	s.deferredConnectSession.Start(runCtx)
 	s.startDNSWorkers(runCtx, conn, reqCh, &workerWG)
+	s.startRequestQueueWatchdog(runCtx, reqCh, cancel, fatalErrCh)
 
 	go func() {
 		<-runCtx.Done()
@@ -357,6 +359,14 @@ func (s *Server) Run(ctx context.Context) error {
 
 	readerWG.Wait()
 	close(reqCh)
+
+	select {
+	case err := <-fatalErrCh:
+		waitForCleanupDone(cleanupDone)
+		return err
+	default:
+	}
+
 	workerWG.Wait()
 	cancel()
 	<-cleanupDone
@@ -366,6 +376,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	select {
+	case err := <-fatalErrCh:
+		return err
 	case err := <-readErrCh:
 		return err
 	default:

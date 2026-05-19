@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net"
 	"os"
@@ -35,6 +34,7 @@ const (
 	defaultBusyCooldown  = 20 * time.Second
 	defaultMaxSessions   = 245
 	defaultCleanupPeriod = 5 * time.Second
+	defaultMissCooldown  = 2 * time.Second
 )
 
 type routeKey struct {
@@ -53,7 +53,18 @@ type waiterKey struct {
 }
 
 type responseWaiter struct {
-	ch chan []byte
+	ch chan backendResponse
+}
+
+type backendResponse struct {
+	packet []byte
+	err    error
+}
+
+type clientRequest struct {
+	packet []byte
+	client *net.UDPAddr
+	local  net.IP
 }
 
 type backend struct {
@@ -97,11 +108,19 @@ type proxy struct {
 	sessionTTL   time.Duration
 	busyCooldown time.Duration
 	maxSessions  int64
+	readers      int
+	workers      int
+	queueDepth   int
 
-	mu       sync.Mutex
-	routes   map[routeKey]sessionRoute
-	initMap  map[string]sessionRoute
-	rrCursor uint64
+	mu          sync.Mutex
+	routes      map[routeKey]sessionRoute
+	initMap     map[string]sessionRoute
+	missMap     map[routeKey]time.Time
+	rrCursor    atomic.Uint64
+	clientDrops atomic.Uint64
+	routeMisses atomic.Uint64
+	recovered   atomic.Uint64
+	collisions  atomic.Uint64
 }
 
 func main() {
@@ -112,12 +131,42 @@ func main() {
 	sessionTTL := flag.Duration("session-ttl", defaultSessionTTL, "local session route TTL")
 	busyCooldown := flag.Duration("busy-cooldown", defaultBusyCooldown, "backend cooldown after SESSION_BUSY")
 	maxSessions := flag.Int64("max-sessions", defaultMaxSessions, "soft active-session limit per backend")
+	socketBuffer := flag.Int("socket-buffer", 0, "UDP socket read/write buffer bytes; default uses SOCKET_BUFFER_SIZE from config")
+	readers := flag.Int("readers", 0, "client UDP reader goroutines; default uses UDP_READERS from config")
+	workers := flag.Int("workers", 0, "client packet worker goroutines; default uses DNS_REQUEST_WORKERS from config")
+	queueDepth := flag.Int("queue", 0, "client packet queue depth; default uses MAX_CONCURRENT_REQUESTS from config")
 	flag.Parse()
 
 	cfg, err := config.LoadServerConfigWithOverrides(runtimepath.Resolve(*configPath), config.ServerConfigOverrides{})
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	bufferSize := cfg.SocketBufferSize
+	if *socketBuffer > 0 {
+		bufferSize = *socketBuffer
+	}
+	clientReaders := cfg.UDPReaders
+	if *readers > 0 {
+		clientReaders = *readers
+	}
+	if clientReaders < 1 {
+		clientReaders = 1
+	}
+	clientWorkers := cfg.DNSRequestWorkers
+	if *workers > 0 {
+		clientWorkers = *workers
+	}
+	if clientWorkers < 1 {
+		clientWorkers = 1
+	}
+	clientQueueDepth := cfg.MaxConcurrentRequests
+	if *queueDepth > 0 {
+		clientQueueDepth = *queueDepth
+	}
+	if clientQueueDepth < clientWorkers {
+		clientQueueDepth = clientWorkers
+	}
+
 	keyInfo, err := security.EnsureServerEncryptionKey(cfg)
 	if err != nil {
 		log.Fatalf("load encryption key: %v", err)
@@ -136,8 +185,12 @@ func main() {
 		log.Fatalf("listen %s: %v", *listenAddr, err)
 	}
 	defer listener.Close()
+	if err := enableDestinationPacketInfo(listener); err != nil {
+		log.Fatalf("enable destination packet info: %v", err)
+	}
+	configureUDPBuffers("client listener", listener, bufferSize)
 
-	backends, err := openBackends(*backendList)
+	backends, err := openBackends(*backendList, bufferSize)
 	if err != nil {
 		log.Fatalf("open backends: %v", err)
 	}
@@ -154,8 +207,12 @@ func main() {
 		sessionTTL:   *sessionTTL,
 		busyCooldown: *busyCooldown,
 		maxSessions:  *maxSessions,
+		readers:      clientReaders,
+		workers:      clientWorkers,
+		queueDepth:   clientQueueDepth,
 		routes:       make(map[routeKey]sessionRoute),
 		initMap:      make(map[string]sessionRoute),
+		missMap:      make(map[routeKey]time.Time),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -167,11 +224,26 @@ func main() {
 	go p.cleanupLoop(ctx)
 	go p.statsLoop(ctx)
 
-	log.Printf("stormdns-proxy listening on %s with %d backends", listener.LocalAddr(), len(backends))
+	log.Printf(
+		"stormdns-proxy listening on %s with %d backends readers=%d workers=%d queue=%d socket-buffer=%d",
+		listener.LocalAddr(), len(backends), clientReaders, clientWorkers, clientQueueDepth, bufferSize,
+	)
 	p.serve(ctx)
 }
 
-func openBackends(csv string) ([]*backend, error) {
+func configureUDPBuffers(name string, conn *net.UDPConn, bytes int) {
+	if conn == nil || bytes <= 0 {
+		return
+	}
+	if err := conn.SetReadBuffer(bytes); err != nil {
+		log.Printf("%s UDP read buffer setup failed: %v", name, err)
+	}
+	if err := conn.SetWriteBuffer(bytes); err != nil {
+		log.Printf("%s UDP write buffer setup failed: %v", name, err)
+	}
+}
+
+func openBackends(csv string, socketBuffer int) ([]*backend, error) {
 	parts := strings.Split(csv, ",")
 	var out []*backend
 	for _, part := range parts {
@@ -187,6 +259,7 @@ func openBackends(csv string) ([]*backend, error) {
 		if err != nil {
 			return nil, err
 		}
+		configureUDPBuffers("backend "+part, conn, socketBuffer)
 		out = append(out, &backend{
 			name:    part,
 			addr:    addr,
@@ -201,58 +274,168 @@ func openBackends(csv string) ([]*backend, error) {
 }
 
 func (p *proxy) serve(ctx context.Context) {
+	reqCh := make(chan clientRequest, p.queueDepth)
+	var workerWG sync.WaitGroup
+	for workerID := 1; workerID <= p.workers; workerID++ {
+		workerWG.Add(1)
+		go p.clientWorker(ctx, reqCh, &workerWG)
+	}
+
+	var readerWG sync.WaitGroup
+	for readerID := 1; readerID <= p.readers; readerID++ {
+		readerWG.Add(1)
+		go p.clientReader(ctx, reqCh, &readerWG)
+	}
+
+	<-ctx.Done()
+	_ = p.listen.Close()
+	readerWG.Wait()
+	close(reqCh)
+	workerWG.Wait()
+}
+
+func (p *proxy) clientReader(ctx context.Context, reqCh chan<- clientRequest, wg *sync.WaitGroup) {
+	defer wg.Done()
 	buf := make([]byte, 65535)
+	oob := make([]byte, packetInfoOOBSize())
 	for {
-		_ = p.listen.SetReadDeadline(time.Now().Add(time.Second))
-		n, client, err := p.listen.ReadFromUDP(buf)
+		n, client, local, err := readClientPacket(p.listen, buf, oob)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
-			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
 			}
 			log.Printf("read client: %v", err)
 			continue
 		}
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
-		go p.handleClientPacket(packet, client)
+		select {
+		case reqCh <- clientRequest{packet: packet, client: client, local: local}:
+		case <-ctx.Done():
+			return
+		default:
+			p.clientDrops.Add(1)
+		}
 	}
 }
 
-func (p *proxy) handleClientPacket(packet []byte, client *net.UDPAddr) {
+func (p *proxy) clientWorker(ctx context.Context, reqCh <-chan clientRequest, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-reqCh:
+			if !ok {
+				return
+			}
+			p.handleClientPacket(req)
+		}
+	}
+}
+
+func (p *proxy) handleClientPacket(req clientRequest) {
+	packet := req.packet
 	parsed, decision, vpnPacket, key, err := p.parseRequest(packet)
 	if err != nil || decision.Action != domainMatcher.ActionProcess {
-		p.forwardSimple(packet, client, 0)
+		p.forwardSimple(req, 0)
 		return
 	}
 
 	if vpnPacket.PacketType == Enums.PACKET_SESSION_INIT {
-		p.handleSessionInit(packet, client, parsed, vpnPacket)
+		p.handleSessionInit(req, parsed, vpnPacket)
 		return
 	}
 
 	backendIdx, ok := p.lookupRoute(key)
 	if !ok {
-		backendIdx = p.fallbackBackend(key)
+		p.routeMisses.Add(1)
+		if p.recoverRoute(req, parsed, vpnPacket, key) {
+			return
+		}
+		return
 	}
 	resp, err := p.forward(packet, parsed, backendIdx)
 	if err == nil && len(resp) > 0 {
-		_, _ = p.listen.WriteToUDP(resp, client)
+		p.writeClientResponse(resp, req)
 	}
 	if vpnPacket.PacketType == Enums.PACKET_SESSION_CLOSE {
 		p.dropRoute(key, backendIdx)
 	}
 }
 
-func (p *proxy) handleSessionInit(packet []byte, client *net.UDPAddr, parsed DnsParser.LitePacket, vpnPacket VpnProto.Packet) {
+func (p *proxy) recoverRoute(req clientRequest, parsed DnsParser.LitePacket, vpnPacket VpnProto.Packet, key routeKey) bool {
+	if p.routeMissCoolingDown(key) {
+		return false
+	}
+
+	for _, idx := range p.backendOrder() {
+		if p.backendBusy(idx) {
+			continue
+		}
+		resp, err := p.forward(req.packet, parsed, idx)
+		if err != nil || len(resp) == 0 {
+			continue
+		}
+		packetType := vpnResponseType(resp)
+		if packetType == Enums.PACKET_ERROR_DROP || packetType == Enums.PACKET_SESSION_BUSY || packetType == 0 {
+			continue
+		}
+
+		p.setRoute(key, "", idx)
+		p.recovered.Add(1)
+		p.writeClientResponse(resp, req)
+		if vpnPacket.PacketType == Enums.PACKET_SESSION_CLOSE {
+			p.dropRoute(key, idx)
+		}
+		return true
+	}
+
+	p.rememberRouteMiss(key)
+	return false
+}
+
+func vpnResponseType(resp []byte) uint8 {
+	packet, err := DnsParser.ExtractVPNResponse(resp, false)
+	if err != nil {
+		packet, err = DnsParser.ExtractVPNResponse(resp, true)
+	}
+	if err != nil {
+		return 0
+	}
+	return packet.PacketType
+}
+
+func (p *proxy) routeMissCoolingDown(key routeKey) bool {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	until, ok := p.missMap[key]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(p.missMap, key)
+	return false
+}
+
+func (p *proxy) rememberRouteMiss(key routeKey) {
+	p.mu.Lock()
+	p.missMap[key] = time.Now().Add(defaultMissCooldown)
+	p.mu.Unlock()
+}
+
+func (p *proxy) handleSessionInit(req clientRequest, parsed DnsParser.LitePacket, vpnPacket VpnProto.Packet) {
+	packet := req.packet
 	initKey := string(vpnPacket.Payload)
 	if idx, ok := p.lookupInit(initKey); ok {
 		resp, err := p.forward(packet, parsed, idx)
 		if err == nil && len(resp) > 0 {
 			p.observeResponse(idx, initKey, resp)
-			_, _ = p.listen.WriteToUDP(resp, client)
+			p.writeClientResponse(resp, req)
 			return
 		}
 	}
@@ -273,12 +456,12 @@ func (p *proxy) handleSessionInit(packet []byte, client *net.UDPAddr, parsed Dns
 			p.markBusy(idx)
 			continue
 		}
-		_, _ = p.listen.WriteToUDP(resp, client)
+		p.writeClientResponse(resp, req)
 		return
 	}
 
 	if len(lastResp) > 0 {
-		_, _ = p.listen.WriteToUDP(lastResp, client)
+		p.writeClientResponse(lastResp, req)
 	}
 }
 
@@ -298,14 +481,20 @@ func (p *proxy) parseRequest(packet []byte) (DnsParser.LitePacket, domainMatcher
 	return parsed, decision, vpnPacket, routeKey{id: vpnPacket.SessionID, cookie: vpnPacket.SessionCookie}, nil
 }
 
-func (p *proxy) forwardSimple(packet []byte, client *net.UDPAddr, idx int) {
-	parsed, err := DnsParser.ParseDNSRequestLite(packet)
+func (p *proxy) forwardSimple(req clientRequest, idx int) {
+	parsed, err := DnsParser.ParseDNSRequestLite(req.packet)
 	if err != nil {
 		return
 	}
-	resp, err := p.forward(packet, parsed, idx)
+	resp, err := p.forward(req.packet, parsed, idx)
 	if err == nil && len(resp) > 0 {
-		_, _ = p.listen.WriteToUDP(resp, client)
+		p.writeClientResponse(resp, req)
+	}
+}
+
+func (p *proxy) writeClientResponse(packet []byte, req clientRequest) {
+	if err := writeClientPacket(p.listen, packet, req.client, req.local); err != nil {
+		log.Printf("write client %s via %s: %v", req.client, req.local, err)
 	}
 }
 
@@ -315,7 +504,7 @@ func (p *proxy) forward(packet []byte, parsed DnsParser.LitePacket, idx int) ([]
 	}
 	b := p.backends[idx]
 	key := waiterKey{id: parsed.Header.ID, qname: parsed.FirstQuestion.Name}
-	waiter := responseWaiter{ch: make(chan []byte, 1)}
+	waiter := responseWaiter{ch: make(chan backendResponse, 1)}
 
 	b.waitersMu.Lock()
 	b.waiters[key] = append(b.waiters[key], waiter)
@@ -325,16 +514,21 @@ func (p *proxy) forward(packet []byte, parsed DnsParser.LitePacket, idx int) ([]
 	_, err := b.conn.Write(packet)
 	if err != nil {
 		p.removeWaiter(b, key, waiter)
+		p.markBusy(idx)
 		return nil, err
 	}
 
 	timer := time.NewTimer(p.timeout)
 	defer timer.Stop()
 	select {
-	case resp := <-waiter.ch:
-		return resp, nil
+	case result := <-waiter.ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.packet, nil
 	case <-timer.C:
 		p.removeWaiter(b, key, waiter)
+		p.markBusy(idx)
 		b.timeouts.Add(1)
 		return nil, os.ErrDeadlineExceeded
 	}
@@ -354,6 +548,8 @@ func (p *proxy) readBackend(ctx context.Context, idx int) {
 				continue
 			}
 			log.Printf("read backend %s: %v", b.name, err)
+			p.markBusy(idx)
+			p.failBackendWaiters(b, err)
 			continue
 		}
 		resp := make([]byte, n)
@@ -374,7 +570,7 @@ func (p *proxy) readBackend(ctx context.Context, idx int) {
 			}
 			b.waitersMu.Unlock()
 			b.responses.Add(1)
-			waiter.ch <- resp
+			waiter.ch <- backendResponse{packet: resp}
 			continue
 		}
 		b.waitersMu.Unlock()
@@ -394,8 +590,13 @@ func (p *proxy) observeResponse(idx int, initKey string, resp []byte) uint8 {
 	case Enums.PACKET_SESSION_ACCEPT:
 		if len(packet.Payload) >= 2 {
 			key := routeKey{id: packet.Payload[0], cookie: packet.Payload[1]}
-			p.setRoute(key, initKey, idx)
-			b.accepted.Add(1)
+			if p.setRoute(key, initKey, idx) {
+				b.accepted.Add(1)
+			} else {
+				b.sessionErr.Add(1)
+				p.collisions.Add(1)
+				return Enums.PACKET_SESSION_BUSY
+			}
 		}
 	case Enums.PACKET_SESSION_BUSY:
 		b.busy.Add(1)
@@ -405,20 +606,20 @@ func (p *proxy) observeResponse(idx int, initKey string, resp []byte) uint8 {
 	return packet.PacketType
 }
 
-func (p *proxy) setRoute(key routeKey, initKey string, idx int) {
+func (p *proxy) setRoute(key routeKey, initKey string, idx int) bool {
 	expires := time.Now().Add(p.sessionTTL)
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if old, ok := p.routes[key]; !ok {
 		p.backends[idx].incActive()
 	} else if old.backend != idx {
-		p.backends[old.backend].decActive()
-		p.backends[idx].incActive()
+		return false
 	}
 	p.routes[key] = sessionRoute{backend: idx, expires: expires}
 	if initKey != "" {
 		p.initMap[initKey] = sessionRoute{backend: idx, expires: expires}
 	}
-	p.mu.Unlock()
+	return true
 }
 
 func (p *proxy) lookupRoute(key routeKey) (int, bool) {
@@ -474,10 +675,14 @@ func (p *proxy) dropRoute(key routeKey, idx int) {
 
 func (p *proxy) backendAvailable(idx int) bool {
 	b := p.backends[idx]
-	if time.Now().UnixNano() < b.busyUntil.Load() {
+	if p.backendBusy(idx) {
 		return false
 	}
 	return b.active.Load() < p.maxSessions
+}
+
+func (p *proxy) backendBusy(idx int) bool {
+	return time.Now().UnixNano() < p.backends[idx].busyUntil.Load()
 }
 
 func (p *proxy) markBusy(idx int) {
@@ -492,8 +697,7 @@ func (p *proxy) backendOrder() []int {
 		rr     uint64
 	}
 	now := time.Now().UnixNano()
-	base := p.rrCursor
-	p.rrCursor++
+	base := p.rrCursor.Add(1) - 1
 	items := make([]scored, 0, len(p.backends))
 	for idx, b := range p.backends {
 		items = append(items, scored{
@@ -519,12 +723,6 @@ func (p *proxy) backendOrder() []int {
 	return out
 }
 
-func (p *proxy) fallbackBackend(key routeKey) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte{key.id, key.cookie})
-	return int(h.Sum32() % uint32(len(p.backends)))
-}
-
 func (p *proxy) removeWaiter(b *backend, key waiterKey, waiter responseWaiter) {
 	b.waitersMu.Lock()
 	defer b.waitersMu.Unlock()
@@ -539,6 +737,22 @@ func (p *proxy) removeWaiter(b *backend, key waiterKey, waiter responseWaiter) {
 		delete(b.waiters, key)
 	} else {
 		b.waiters[key] = waiters
+	}
+}
+
+func (p *proxy) failBackendWaiters(b *backend, err error) {
+	b.waitersMu.Lock()
+	pending := b.waiters
+	b.waiters = make(map[waiterKey][]responseWaiter)
+	b.waitersMu.Unlock()
+
+	for _, waiters := range pending {
+		for _, waiter := range waiters {
+			select {
+			case waiter.ch <- backendResponse{err: err}:
+			default:
+			}
+		}
 	}
 }
 
@@ -569,6 +783,11 @@ func (p *proxy) cleanupExpired() {
 			delete(p.initMap, key)
 		}
 	}
+	for key, until := range p.missMap {
+		if now.After(until) {
+			delete(p.missMap, key)
+		}
+	}
 	p.mu.Unlock()
 }
 
@@ -588,7 +807,7 @@ func (p *proxy) statsLoop(ctx context.Context) {
 					b.timeouts.Load(), b.accepted.Load(), b.busy.Load(),
 				))
 			}
-			log.Printf("stats %s", strings.Join(parts, " | "))
+			log.Printf("stats drops=%d route_miss=%d recovered=%d collisions=%d %s", p.clientDrops.Load(), p.routeMisses.Load(), p.recovered.Load(), p.collisions.Load(), strings.Join(parts, " | "))
 		}
 	}
 }

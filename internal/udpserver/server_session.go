@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -698,6 +698,24 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		resolvedDownload,
 		s.cfg.MaxPacketsPerBatch,
 	)
+	if err == ErrSessionTableFull {
+		expired := s.sessions.Cleanup(time.Now(), s.cfg.SessionTimeout(), s.cfg.ClosedSessionRetention())
+		for _, expiredSession := range expired {
+			s.cleanupClosedSession(expiredSession.ID, expiredSession.record)
+		}
+		if len(expired) > 0 && s.log != nil {
+			s.log.Warnf(
+				"\U0001F9F9 <yellow>Session Table Full Recovery</yellow> <magenta>|</magenta> <blue>Expired</blue>: <cyan>%d</cyan>",
+				len(expired),
+			)
+		}
+		record, reused, err = s.sessions.findOrCreate(
+			vpnPacket.Payload,
+			resolvedUpload,
+			resolvedDownload,
+			s.cfg.MaxPacketsPerBatch,
+		)
+	}
 	if err != nil {
 		if err == ErrSessionTableFull {
 			if s.log != nil {

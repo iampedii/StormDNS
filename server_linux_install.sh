@@ -107,7 +107,7 @@ Options:
   -v, --version <VERSION>   Install a specific StormDNS release (tag), e.g. v1.2.3.
                             If omitted, the latest release is installed.
   -u, --uninstall           Uninstall StormDNS: stop and remove the systemd
-                            service, drop kernel/limit tunings, and clean up
+                            services, drop kernel/limit tunings, and clean up
                             binaries and config files in the install directory.
   -h, --help                Show this help message and exit.
 
@@ -215,6 +215,16 @@ do_uninstall() {
     rm -f /etc/systemd/system/stormdns.service
     log_success "Removed /etc/systemd/system/stormdns.service"
   fi
+  if systemctl list-unit-files --all 2>/dev/null | grep -q '^stormdns-proxy\.service'; then
+    log_info "Stopping and disabling stormdns-proxy service..."
+    systemctl stop stormdns-proxy 2>/dev/null || true
+    systemctl disable stormdns-proxy >/dev/null 2>&1 || true
+    systemctl reset-failed stormdns-proxy 2>/dev/null || true
+  fi
+  if [[ -f /etc/systemd/system/stormdns-proxy.service ]]; then
+    rm -f /etc/systemd/system/stormdns-proxy.service
+    log_success "Removed /etc/systemd/system/stormdns-proxy.service"
+  fi
   systemctl daemon-reload 2>/dev/null || true
 
   local pid cmdline
@@ -253,6 +263,9 @@ do_uninstall() {
   local removed=0
   for f in \
     "$INSTALL_DIR"/StormDNS_Server_Linux*_v* \
+    "$INSTALL_DIR"/StormDNS_Proxy_Linux*_v* \
+    "$INSTALL_DIR"/stormdns-proxy \
+    "$INSTALL_DIR"/stormdns_god_mode.sh \
     "$INSTALL_DIR"/server_config.toml \
     "$INSTALL_DIR"/server_config.toml.backup \
     "$INSTALL_DIR"/server_config.toml.bak \
@@ -670,11 +683,24 @@ log_success "Files extracted."
 EXECUTABLE="$(ls -t ${PREFIX}_v* 2>/dev/null | head -n1 || true)"
 [[ -z "$EXECUTABLE" ]] && log_error "Binary not found in package."
 chmod +x "$EXECUTABLE"
+PROXY_EXECUTABLE="$(ls -t StormDNS_Proxy_Linux*_v* 2>/dev/null | head -n1 || true)"
+if [[ -n "$PROXY_EXECUTABLE" ]]; then
+  chmod +x "$PROXY_EXECUTABLE"
+fi
+if [[ -f stormdns_god_mode.sh ]]; then
+  chmod +x stormdns_god_mode.sh
+fi
 shopt -s nullglob
 for old_bin in ${PREFIX}_v*; do
   [[ "$old_bin" == "$EXECUTABLE" ]] && continue
   rm -f -- "$old_bin"
 done
+if [[ -n "${PROXY_EXECUTABLE:-}" ]]; then
+  for old_proxy_bin in StormDNS_Proxy_Linux*_v*; do
+    [[ "$old_proxy_bin" == "$PROXY_EXECUTABLE" ]] && continue
+    rm -f -- "$old_proxy_bin"
+  done
+fi
 shopt -u nullglob
 
 log_header "Configuration"

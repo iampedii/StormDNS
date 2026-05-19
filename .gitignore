@@ -18,6 +18,7 @@ logs/
 *.zip
 *.tar.gz
 *.bak
+*.bak-*
 *.tmp
 *.exe
 build/

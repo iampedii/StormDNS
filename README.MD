@@ -156,7 +156,7 @@ The installer also accepts the following options, which can be passed directly t
 | Option | Description |
 | --- | --- |
 | `-v <VERSION>`, `--version <VERSION>` | Install a specific StormDNS release tag (e.g. `v1.2.3`) instead of the latest release. |
-| `-u`, `--uninstall` | Uninstall StormDNS: stop and remove the `stormdns` systemd service, drop the kernel/limit tunings, and clean up the binary, `server_config.toml`, and `encrypt_key.txt` in the current directory. |
+| `-u`, `--uninstall` | Uninstall StormDNS: stop and remove StormDNS systemd services, drop the kernel/limit tunings, and clean up the binary, `server_config.toml`, and `encrypt_key.txt` in the current directory. |
 | `-h`, `--help` | Show usage help and exit. |
 
 Examples:
@@ -171,7 +171,21 @@ bash <(curl -Ls https://raw.githubusercontent.com/nullroute1970/StormDNS/main/se
 
 > Note: For uninstall, run the command from the same working directory where StormDNS was originally installed so the script can locate the binary, config file, and encryption key.
 
-#### Step 1.2.2: Important Notes After Installation
+#### Step 1.2.2: Optional God-Mode Cluster Deployment
+
+Linux server packages include `stormdns_god_mode.sh` and the matching `StormDNS_Proxy_*` binary. Use this mode when one server should run multiple StormDNS backend containers behind the aware UDP proxy:
+
+```bash
+sudo ./stormdns_god_mode.sh
+```
+
+The script asks for the total number of backend containers, checks the required domain and encryption-key settings, writes the Docker Compose cluster in `stormdns-docker/`, installs `stormdns-proxy.service`, and starts the whole stack. You can also run it without prompts:
+
+```bash
+sudo ./stormdns_god_mode.sh --instances 20 --yes
+```
+
+#### Step 1.2.3: Important Notes After Installation
 
 - During installation, you will be asked for a domain. It must be the same delegated subdomain you configured in the `NS` record, for example `v.example.com`.
 - After creating DNS records, wait for propagation. This may take from a few minutes to several hours, and in some cases up to 48 hours depending on TTL and the DNS provider.

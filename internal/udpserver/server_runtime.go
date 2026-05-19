@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -10,11 +10,21 @@ package udpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"stormdns-go/internal/logger"
+)
+
+var errRequestQueueSaturated = errors.New("request queue saturated")
+
+const (
+	requestQueueWatchdogInterval      = 2 * time.Second
+	requestQueueSaturationGracePeriod = 30 * time.Second
+	requestQueueSaturationWarnAfter   = 10 * time.Second
+	requestQueueSaturationRatio       = 0.90
 )
 
 func (s *Server) configureSocketBuffers(conn *net.UDPConn) {
@@ -25,6 +35,93 @@ func (s *Server) configureSocketBuffers(conn *net.UDPConn) {
 	if err := conn.SetWriteBuffer(s.cfg.SocketBufferSize); err != nil {
 		s.log.Warnf("\U0001F4E1 <yellow>UDP Write Buffer Setup Failed, <cyan>%v</cyan></yellow>", err)
 	}
+}
+
+func (s *Server) startRequestQueueWatchdog(ctx context.Context, reqCh <-chan request, cancel context.CancelFunc, fatalErrCh chan<- error) {
+	if s == nil || reqCh == nil || cancel == nil || fatalErrCh == nil {
+		return
+	}
+
+	queueCap := cap(reqCh)
+	if queueCap <= 0 {
+		return
+	}
+
+	threshold := int(float64(queueCap) * requestQueueSaturationRatio)
+	if threshold < 1 {
+		threshold = 1
+	}
+
+	go func() {
+		ticker := time.NewTicker(requestQueueWatchdogInterval)
+		defer ticker.Stop()
+
+		var saturatedSince time.Time
+		var warned bool
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				queueLen := len(reqCh)
+				if queueLen < threshold {
+					saturatedSince = time.Time{}
+					warned = false
+					continue
+				}
+
+				if saturatedSince.IsZero() {
+					saturatedSince = now
+					warned = false
+				}
+
+				saturatedFor := now.Sub(saturatedSince)
+				if !warned && saturatedFor >= requestQueueSaturationWarnAfter {
+					warned = true
+					if s.log != nil {
+						s.log.Warnf(
+							"\U0001F6A8 <yellow>Request Queue Saturated</yellow> <magenta>|</magenta> <blue>Queue</blue>: <cyan>%d/%d</cyan> <magenta>|</magenta> <blue>Duration</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Dropped</blue>: <cyan>%d</cyan>",
+							queueLen,
+							queueCap,
+							saturatedFor.Round(time.Second),
+							s.droppedPackets.Load(),
+						)
+					}
+				}
+
+				if saturatedFor < requestQueueSaturationGracePeriod {
+					continue
+				}
+
+				err := fmt.Errorf(
+					"%w: queue=%d/%d threshold=%d saturated_for=%s dropped=%d",
+					errRequestQueueSaturated,
+					queueLen,
+					queueCap,
+					threshold,
+					saturatedFor.Round(time.Second),
+					s.droppedPackets.Load(),
+				)
+				if s.log != nil {
+					s.log.Errorf(
+						"\U0001F4A5 <red>Request Queue Watchdog Triggered</red> <magenta>|</magenta> <blue>Queue</blue>: <cyan>%d/%d</cyan> <magenta>|</magenta> <blue>Duration</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Dropped</blue>: <cyan>%d</cyan>",
+						queueLen,
+						queueCap,
+						saturatedFor.Round(time.Second),
+						s.droppedPackets.Load(),
+					)
+				}
+
+				select {
+				case fatalErrCh <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+		}
+	}()
 }
 
 func (s *Server) startDNSWorkers(ctx context.Context, conn *net.UDPConn, reqCh <-chan request, workerWG *sync.WaitGroup) {
@@ -49,6 +146,13 @@ func (s *Server) startReaders(ctx context.Context, conn *net.UDPConn, reqCh chan
 				}
 			}
 		}(i + 1)
+	}
+}
+
+func waitForCleanupDone(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
 	}
 }
 

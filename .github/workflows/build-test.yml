@@ -315,6 +315,20 @@ jobs:
         run: |
           go build -ldflags "-X stormdns-go/internal/version.BuildVersion=${{ needs.preflight.outputs.release_tag }}" -o dist/StormDNS_Server_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }} ./cmd/server
 
+      - name: Build proxy
+        if: ${{ matrix.go_os == 'linux' }}
+        env:
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+          GOOS: ${{ matrix.go_os }}
+          GOARCH: ${{ matrix.go_arch }}
+          GOARM: ${{ matrix.go_arm }}
+          GOMIPS: ${{ matrix.go_mips }}
+          GOMIPS64: ${{ matrix.go_mips64 }}
+          CC: ${{ env.CC }}
+          CXX: ${{ env.CXX }}
+        run: |
+          go build -ldflags "-X stormdns-go/internal/version.BuildVersion=${{ needs.preflight.outputs.release_tag }}" -o dist/StormDNS_Proxy_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }} ./cmd/stormdns-proxy
+
       - name: Verify Linux-Legacy binaries are not dynamically linked
         if: ${{ matrix.platform == 'Linux-Legacy' }}
         shell: bash
@@ -339,6 +353,10 @@ jobs:
           cp client_config.toml.simple dist/client_config.toml || true
           cp client_resolvers.simple dist/client_resolvers.txt || true
           cp server_config.toml.simple dist/server_config.toml || true
+          if [[ "${{ matrix.go_os }}" == "linux" ]]; then
+            cp stormdns_god_mode.sh dist/stormdns_god_mode.sh || true
+            chmod +x dist/stormdns_god_mode.sh || true
+          fi
 
       - name: Prepare smoke-test config
         shell: bash
@@ -596,15 +614,20 @@ jobs:
 
           CLIENT_EXE_NAME="${CLIENT_ZIP_BASE}_${TAG}${{ matrix.ext }}"
           SERVER_EXE_NAME="${SERVER_ZIP_BASE}_${TAG}${{ matrix.ext }}"
+          PROXY_EXE_NAME="StormDNS_Proxy_${PLATFORM}_${ARCH_UPPER}_${TAG}${{ matrix.ext }}"
 
           CLIENT_ORIG="StormDNS_Client_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
           SERVER_ORIG="StormDNS_Server_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
+          PROXY_ORIG="StormDNS_Proxy_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
 
           if [ -f "${CLIENT_ORIG}" ]; then
             mv "${CLIENT_ORIG}" "${CLIENT_EXE_NAME}" || true
           fi
           if [ -f "${SERVER_ORIG}" ]; then
             mv "${SERVER_ORIG}" "${SERVER_EXE_NAME}" || true
+          fi
+          if [ -f "${PROXY_ORIG}" ]; then
+            mv "${PROXY_ORIG}" "${PROXY_EXE_NAME}" || true
           fi
 
           CLIENT_ZIP="${CLIENT_ZIP_BASE}.zip"
@@ -622,10 +645,14 @@ jobs:
           [ -f "${CLIENT_README_EN}" ] && CLIENT_FILES+=( "${CLIENT_README_EN}" )
           [ -f "${CLIENT_README_FA}" ] && CLIENT_FILES+=( "${CLIENT_README_FA}" )
 
+          SERVER_FILES=( "${SERVER_EXE_NAME}" "${SERVER_TOML}" )
+          [ -f "${PROXY_EXE_NAME}" ] && SERVER_FILES+=( "${PROXY_EXE_NAME}" )
+          [ -f "stormdns_god_mode.sh" ] && SERVER_FILES+=( "stormdns_god_mode.sh" )
+
           zip -j "${CLIENT_ZIP}" "${CLIENT_FILES[@]}" || true
           tar -czf "${CLIENT_TAR}" "${CLIENT_FILES[@]}" || true
-          zip -j "${SERVER_ZIP}" "${SERVER_EXE_NAME}" "${SERVER_TOML}" || true
-          tar -czf "${SERVER_TAR}" "${SERVER_EXE_NAME}" "${SERVER_TOML}" || true
+          zip -j "${SERVER_ZIP}" "${SERVER_FILES[@]}" || true
+          tar -czf "${SERVER_TAR}" "${SERVER_FILES[@]}" || true
 
           sha256sum "${CLIENT_ZIP}" "${CLIENT_TAR}" "${SERVER_ZIP}" "${SERVER_TAR}" > SHA256SUMS.txt
 
