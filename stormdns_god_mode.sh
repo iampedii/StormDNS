@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="${STORMDNS_ROOT:-${SCRIPT_DIR}}"
+SOURCE_DIR="${STORMDNS_SOURCE_DIR:-${SCRIPT_DIR}}"
 DOCKER_DIR="${STORMDNS_DOCKER_DIR:-}"
 DOCKER_CONFIG_DIR=""
 HOST_CONFIG="${STORMDNS_CONFIG:-}"
@@ -354,8 +355,27 @@ detect_proxy_bin() {
   candidates+=("${ROOT_DIR}"/StormDNS_Proxy_Linux*_v*)
   candidates+=("${ROOT_DIR}"/StormDNS_Proxy_Linux*)
   candidates+=("${ROOT_DIR}"/StormDNS_Proxy_*)
+  candidates+=("${SCRIPT_DIR}/stormdns-proxy")
+  candidates+=("${SCRIPT_DIR}"/StormDNS_Proxy_Linux*_v*)
+  candidates+=("/root/stormdns-proxy")
+  candidates+=("/usr/local/bin/stormdns-proxy")
   shopt -u nullglob
   first_existing_binary "${candidates[@]}"
+}
+
+build_proxy_from_source() {
+  local source_dir="$1"
+  local out="$2"
+  if [[ ! -d "${source_dir}/cmd/stormdns-proxy" || ! -f "${source_dir}/go.mod" ]]; then
+    return 1
+  fi
+  require_command go
+  log "Building stormdns-proxy from source: ${source_dir}"
+  (
+    cd "${source_dir}"
+    GOCACHE="${GOCACHE:-/tmp/stormdns-gocache}" GOTMPDIR="${GOTMPDIR:-/tmp}" go build -o "${out}" ./cmd/stormdns-proxy
+  )
+  chmod 755 "${out}"
 }
 
 install_runtime_binary() {
@@ -380,6 +400,9 @@ resolve_binaries() {
   fi
   if [[ -z "${PROXY_BIN}" ]]; then
     PROXY_BIN="$(detect_proxy_bin || true)"
+  fi
+  if [[ -z "${PROXY_BIN}" ]] && build_proxy_from_source "${SOURCE_DIR}" "${ROOT_DIR}/stormdns-proxy"; then
+    PROXY_BIN="${ROOT_DIR}/stormdns-proxy"
   fi
   [[ -n "${SERVER_BIN}" ]] || die "StormDNS server binary not found; pass --server-bin"
   [[ -n "${PROXY_BIN}" ]] || die "StormDNS proxy binary not found; pass --proxy-bin"
@@ -713,6 +736,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROOT_DIR="$(cd "${ROOT_DIR}" && pwd -P)"
+SOURCE_DIR="$(cd "${SOURCE_DIR}" && pwd -P)"
 DOCKER_DIR="${DOCKER_DIR:-${ROOT_DIR}/stormdns-docker}"
 DOCKER_CONFIG_DIR="${DOCKER_DIR}/config"
 HOST_CONFIG="${HOST_CONFIG:-${ROOT_DIR}/server_config.toml}"
