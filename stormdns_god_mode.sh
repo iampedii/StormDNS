@@ -37,12 +37,14 @@ NON_INTERACTIVE="no"
 CONFIRM="no"
 WARP_EGRESS="yes"
 REGENERATE_KEY="no"
+RUN_MODE=""
 
 usage() {
   cat <<EOF
 Usage: sudo $0 [OPTIONS]
 
 Starts the StormDNS Docker backend cluster and the aware UDP proxy frontend.
+On rerun, asks whether to update in place or redo with a new key/secret.
 
 Options:
   --instances N           Number of StormDNS backend containers.
@@ -338,6 +340,108 @@ domain_array_literal() {
   printf '[%s]\n' "${out}"
 }
 
+domain_values() {
+  local file="$1"
+  sed -n -E 's|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[(.*)\].*|\1|p' "${file}" |
+    grep -oE '"[^"]+"' |
+    sed -E 's/^"//; s/"$//' || true
+}
+
+domain_csv() {
+  local item out
+  out=""
+  while IFS= read -r item; do
+    [[ -n "${item}" ]] || continue
+    if [[ -n "${out}" ]]; then
+      out+=","
+    fi
+    out+="${item}"
+  done < <(domain_values "${HOST_CONFIG}")
+  printf '%s\n' "${out}"
+}
+
+domains_literal_from_values() {
+  local item out
+  out=""
+  for item in "$@"; do
+    [[ -n "${item}" ]] || continue
+    [[ "${item}" =~ ^[A-Za-z0-9*._-]+$ ]] || die "invalid domain: ${item}"
+    if [[ -n "${out}" ]]; then
+      out+=", "
+    fi
+    out+="\"${item}\""
+  done
+  [[ -n "${out}" ]] || die "at least one domain is required"
+  printf '[%s]\n' "${out}"
+}
+
+config_needs_domain() {
+  grep -Eq '^[[:space:]]*DOMAIN[[:space:]]*=.*v\.domain\.com|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[[[:space:]]*\]' "${HOST_CONFIG}"
+}
+
+prompt_set_domains() {
+  local prompt="$1"
+  local default="${2:-}"
+  local domains literal
+
+  while true; do
+    if [[ -n "${default}" ]]; then
+      prompt_read "${prompt} [${default}]: " domains
+      domains="${domains:-${default}}"
+    else
+      prompt_read "${prompt}: " domains
+    fi
+    domains="$(trim "${domains}")"
+    [[ -n "${domains}" ]] || continue
+    literal="$(domain_array_literal "${domains}")"
+    backup_file "${HOST_CONFIG}" "${BACKUP_DIR}"
+    set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
+    log "Configured DOMAIN = ${literal}"
+    break
+  done
+}
+
+append_domains_to_config() {
+  local raw="$1"
+  local item key literal
+  local -a current=()
+  local -a additions=()
+  local -A seen=()
+
+  while IFS= read -r item; do
+    [[ -n "${item}" ]] || continue
+    current+=("${item}")
+    key="${item%.}"
+    seen["${key,,}"]=1
+  done < <(domain_values "${HOST_CONFIG}")
+
+  IFS=',' read -r -a additions <<< "${raw}"
+  for item in "${additions[@]}"; do
+    item="$(trim "${item}")"
+    [[ -n "${item}" ]] || continue
+    [[ "${item}" =~ ^[A-Za-z0-9*._-]+$ ]] || die "invalid domain: ${item}"
+    key="${item%.}"
+    key="${key,,}"
+    if [[ -z "${seen[${key}]:-}" ]]; then
+      current+=("${item}")
+      seen["${key}"]=1
+    fi
+  done
+
+  literal="$(domains_literal_from_values "${current[@]}")"
+  backup_file "${HOST_CONFIG}" "${BACKUP_DIR}"
+  set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
+  log "Configured DOMAIN = ${literal}"
+}
+
+prompt_add_domains() {
+  local domains
+  prompt_read "Enter additional tunnel domain(s), comma-separated: " domains
+  domains="$(trim "${domains}")"
+  [[ -n "${domains}" ]] || return 0
+  append_domains_to_config "${domains}"
+}
+
 config_value() {
   local file="$1"
   local key="$2"
@@ -391,43 +495,44 @@ ensure_key_file() {
 
   if [[ -f "${KEY_FILE}" ]]; then
     existing="$(tr -d '[:space:]' < "${KEY_FILE}")"
-    if [[ "${#existing}" -eq "${required}" ]]; then
+    if [[ "${REGENERATE_KEY}" != "yes" && "${#existing}" -eq "${required}" ]]; then
       chmod 600 "${KEY_FILE}" || true
       return
     fi
-    log "Existing key has length ${#existing}; expected ${required} for DATA_ENCRYPTION_METHOD=${method}"
-    [[ "${REGENERATE_KEY}" == "yes" ]] || die "valid encryption key is required; fix ${KEY_FILE} or rerun with --regenerate-key"
+    backup_file "${KEY_FILE}" "${BACKUP_DIR}"
+    if [[ "${REGENERATE_KEY}" != "yes" ]]; then
+      log "Existing key has length ${#existing}; expected ${required} for DATA_ENCRYPTION_METHOD=${method}"
+      die "valid encryption key is required; fix ${KEY_FILE} or rerun with --regenerate-key"
+    fi
   fi
 
   require_command od
   generated="$(generate_key "${required}")"
   printf '%s' "${generated}" > "${KEY_FILE}"
   chmod 600 "${KEY_FILE}"
-  log "Generated encryption key at ${KEY_FILE}"
+  log "Generated encryption key/secret at ${KEY_FILE}"
 }
 
 ensure_config() {
-  local domains literal
   if [[ ! -f "${HOST_CONFIG}" && -f "${ROOT_DIR}/server_config.toml.simple" ]]; then
     cp -a "${ROOT_DIR}/server_config.toml.simple" "${HOST_CONFIG}"
     log "Created ${HOST_CONFIG} from server_config.toml.simple"
   fi
   require_file "${HOST_CONFIG}"
 
-  if grep -Eq '^[[:space:]]*DOMAIN[[:space:]]*=.*v\.domain\.com|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[[[:space:]]*\]' "${HOST_CONFIG}"; then
+  if config_needs_domain; then
     if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
       die "DOMAIN must be configured in ${HOST_CONFIG}"
     fi
-
-    while true; do
-      prompt_read "Enter tunnel domain(s), comma-separated (example: v.example.com): " domains
-      domains="$(trim "${domains}")"
-      [[ -n "${domains}" ]] || continue
-      literal="$(domain_array_literal "${domains}")"
-      set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
-      log "Configured DOMAIN = ${literal}"
-      break
-    done
+    prompt_set_domains "Enter tunnel domain(s), comma-separated (example: v.example.com)"
+  elif [[ "${RUN_MODE}" == "update" ]]; then
+    if ask_yes_no "Add another tunnel domain to the existing DOMAIN list?" "no"; then
+      prompt_add_domains
+    fi
+  elif [[ "${RUN_MODE}" == "redo" ]]; then
+    if [[ "${NON_INTERACTIVE}" != "yes" ]] && ask_yes_no "Replace the DOMAIN list for this redo?" "no"; then
+      prompt_set_domains "Enter tunnel domain(s), comma-separated (example: v.example.com)" "$(domain_csv)"
+    fi
   fi
 
   ensure_key_file
@@ -478,6 +583,35 @@ detect_source_dir() {
       return
     fi
   done
+}
+
+existing_deployment_detected() {
+  [[ -f "${COMPOSE_FILE}" ]] && return 0
+  [[ -f "${DOCKER_CONFIG_DIR}/server_config.toml" ]] && return 0
+  [[ -f "${PROXY_UNIT}" ]] && return 0
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq '^stormdns-[0-9]+$'
+}
+
+choose_run_mode() {
+  if ! existing_deployment_detected; then
+    RUN_MODE="install"
+    return
+  fi
+
+  if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
+    RUN_MODE="update"
+    log "Existing god-mode deployment detected; non-interactive run will update in place"
+    return
+  fi
+
+  log "Existing god-mode deployment detected"
+  if ask_yes_no "Update existing implementation and reuse the same encryption key/secret? Choose no to redo with a new key/secret." "yes"; then
+    RUN_MODE="update"
+  else
+    RUN_MODE="redo"
+    REGENERATE_KEY="yes"
+  fi
+  log "Run mode: ${RUN_MODE}"
 }
 
 detect_server_bin() {
@@ -1182,6 +1316,40 @@ show_status() {
   ss -lunp | awk 'NR == 1 || /:53[[:space:]]/'
 }
 
+encryption_method_name() {
+  local method="$1"
+  case "${method}" in
+    0) printf 'NONE\n' ;;
+    1) printf 'XOR\n' ;;
+    2) printf 'ChaCha20\n' ;;
+    3) printf 'AES-128-GCM\n' ;;
+    4) printf 'AES-192-GCM\n' ;;
+    5) printf 'AES-256-GCM\n' ;;
+    *) printf 'UNKNOWN\n' ;;
+  esac
+}
+
+print_connection_summary() {
+  local method method_name key domains
+  local -a domain_list=()
+  method="$(config_value "${HOST_CONFIG}" "DATA_ENCRYPTION_METHOD")"
+  method="${method:-1}"
+  method_name="$(encryption_method_name "${method}")"
+  key="$(tr -d '[:space:]' < "${KEY_FILE}" 2>/dev/null || true)"
+  mapfile -t domain_list < <(domain_values "${HOST_CONFIG}")
+  domains="$(domains_literal_from_values "${domain_list[@]}")"
+
+  cat <<EOF
+
+StormDNS client values:
+  DOMAIN = ${domains}
+  DATA_ENCRYPTION_METHOD = ${method} (${method_name})
+  ENCRYPTION_KEY = ${key}
+  ENCRYPTION_SECRET = ${key}
+
+EOF
+}
+
 confirm_summary() {
   if [[ "${CONFIRM}" != "yes" || "${NON_INTERACTIVE}" == "yes" ]]; then
     return
@@ -1366,6 +1534,7 @@ COMPOSE_FILE="${DOCKER_DIR}/docker-compose.yml"
 DOCKERFILE="${DOCKER_DIR}/Dockerfile"
 WARP_EGRESS_SCRIPT="${ROOT_DIR}/stormdns-warp-egress.sh"
 BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
+BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%d%H%M%S)-god-mode"
 
 require_root
 ensure_runtime_tools
@@ -1375,6 +1544,7 @@ require_command sed
 require_command awk
 require_command sysctl
 
+choose_run_mode
 ensure_config
 resolve_binaries
 
@@ -1392,7 +1562,6 @@ fi
 
 confirm_summary
 
-BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%d%H%M%S)-god-mode"
 log "Creating backup in ${BACKUP_DIR}"
 backup_file "${COMPOSE_FILE}" "${BACKUP_DIR}"
 backup_file "${DOCKERFILE}" "${BACKUP_DIR}"
@@ -1441,5 +1610,6 @@ log "Starting proxy"
 systemctl restart stormdns-proxy.service
 
 show_status
+print_connection_summary
 
 log "Done. Backup: ${BACKUP_DIR}"
