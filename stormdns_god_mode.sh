@@ -226,6 +226,7 @@ ask_yes_no() {
       prompt_read "${prompt} [y/N]: " answer
       answer="${answer:-n}"
     fi
+    answer="$(trim "${answer}")"
 
     case "${answer}" in
       y|Y|yes|YES) return 0 ;;
@@ -1060,6 +1061,7 @@ stop_service_if_present() {
 }
 
 disable_systemd_resolved_stub() {
+  local owners
   if [[ -f /etc/systemd/resolved.conf ]]; then
     backup_file /etc/systemd/resolved.conf "${BACKUP_DIR}"
     if grep -q '^#\?DNSStubListener=' /etc/systemd/resolved.conf; then
@@ -1074,6 +1076,12 @@ disable_systemd_resolved_stub() {
 
   systemctl restart systemd-resolved >/dev/null 2>&1 || true
   stop_socket_if_present systemd-resolved.socket
+
+  owners="$(port53_owners)"
+  if grep -q 'systemd-resolve' <<< "${owners}"; then
+    log "systemd-resolved still owns UDP/53; stopping and disabling service"
+    stop_service_if_present systemd-resolved.service
+  fi
 }
 
 terminate_pid() {
