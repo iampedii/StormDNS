@@ -227,10 +227,11 @@ ask_yes_no() {
       answer="${answer:-n}"
     fi
     answer="$(trim "${answer}")"
+    answer="${answer//$'\r'/}"
 
     case "${answer}" in
-      y|Y|yes|YES) return 0 ;;
-      n|N|no|NO) return 1 ;;
+      y|Y|yes|YES|y*|Y*) return 0 ;;
+      n|N|no|NO|n*|N*) return 1 ;;
       *) printf 'Please answer yes or no.\n' ;;
     esac
   done
@@ -1121,7 +1122,8 @@ release_port53_conflict() {
     die "UDP port 53 is already owned by another process"
   fi
 
-  ask_yes_no "Stop/disable these UDP/53 owner(s) and continue?" "no" || die "UDP port 53 is already owned by another process"
+  ask_yes_no "Stop/disable these UDP/53 owner(s) and continue?" "yes" || die "UDP port 53 is already owned by another process"
+  log "Confirmed UDP/53 cleanup"
 
   if grep -q 'systemd-resolve' <<< "${owners}"; then
     log "Disabling systemd-resolved DNS stub listener"
