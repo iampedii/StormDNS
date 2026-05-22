@@ -279,6 +279,14 @@ docker_compose() {
   fi
 }
 
+escape_ere() {
+  sed -E 's/[][(){}.^$*+?|\\]/\\&/g' <<< "$1"
+}
+
+compose_project_name() {
+  basename "${DOCKER_DIR}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+//g; s/^[-_]+//; s/[-_]+$//'
+}
+
 backup_file() {
   local path="$1"
   local backup_dir="$2"
@@ -854,11 +862,12 @@ disable_legacy_services() {
 }
 
 cleanup_existing_docker_stack() {
-  local containers
-  log "Redo mode: removing existing StormDNS Docker containers and network"
+  local containers image_ids network project project_re legacy_re
+  log "Redo mode: removing existing StormDNS Docker containers, images, and networks"
 
   if [[ -f "${COMPOSE_FILE}" ]]; then
-    (cd "${DOCKER_DIR}" && docker_compose down --remove-orphans --volumes) >/dev/null 2>&1 || true
+    (cd "${DOCKER_DIR}" && docker_compose down --remove-orphans --volumes --rmi local) >/dev/null 2>&1 ||
+      (cd "${DOCKER_DIR}" && docker_compose down --remove-orphans --volumes) >/dev/null 2>&1 || true
   fi
 
   containers="$(docker ps -a --filter 'name=^stormdns-[0-9]+$' --format '{{.Names}}' 2>/dev/null || true)"
@@ -867,7 +876,25 @@ cleanup_existing_docker_stack() {
     docker rm -f ${containers} >/dev/null 2>&1 || true
   fi
 
+  project="$(compose_project_name)"
+  project_re="$(escape_ere "${project}")"
+  legacy_re="$(escape_ere "stormdns-docker")"
+  image_ids="$(
+    docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null |
+      awk -v project_re="${project_re}" -v legacy_re="${legacy_re}" '
+        $1 ~ "^(" project_re "|" legacy_re ")-stormdns-[0-9]+$" { print $2 }
+      ' |
+      sort -u
+  )"
+  if [[ -n "${image_ids}" ]]; then
+    log "Removing old StormDNS Docker image(s): ${image_ids}"
+    # shellcheck disable=SC2086
+    docker rmi -f ${image_ids} >/dev/null 2>&1 || true
+  fi
+
   docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
+  network="${project}_${NETWORK_NAME}"
+  docker network rm "${network}" >/dev/null 2>&1 || true
 
   if [[ -d "${DOCKER_DIR}" && "${DOCKER_DIR}" != "/" ]]; then
     find "${DOCKER_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + >/dev/null 2>&1 || true
