@@ -24,6 +24,13 @@ DOMAIN = ["v.domain.com"]
 #            FORWARD_IP and FORWARD_PORT below.
 PROTOCOL_TYPE = "SOCKS5"
 
+# Optional interface pinning.
+# - INGRESS_INTERFACE binds the UDP listener to one Linux interface.
+# - EGRESS_INTERFACE binds outbound DNS/SOCKS sockets to one Linux interface.
+# Leave both empty unless that interface exists in this process network namespace.
+INGRESS_INTERFACE = ""
+EGRESS_INTERFACE = ""
+
 # Compression types the server allows the client to request.
 # Allowed values:
 # 0 = OFF

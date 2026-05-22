@@ -20,6 +20,7 @@ import (
 	domainMatcher "stormdns-go/internal/domainmatcher"
 	fragmentStore "stormdns-go/internal/fragmentstore"
 	"stormdns-go/internal/logger"
+	"stormdns-go/internal/netbind"
 	"stormdns-go/internal/security"
 )
 
@@ -188,7 +189,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 		dialStreamUpstreamFn: func(network string, address string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout(network, address, timeout)
+			return netbind.DialContext(context.Background(), network, address, timeout, cfg.EgressInterface)
 		},
 		uploadCompressionMask:    buildCompressionMask(cfg.SupportedUploadCompressionTypes),
 		downloadCompressionMask:  buildCompressionMask(cfg.SupportedDownloadCompressionTypes),
@@ -312,10 +313,11 @@ func (s *Server) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{
+	listenAddr := (&net.UDPAddr{
 		IP:   net.ParseIP(s.cfg.UDPHost),
 		Port: s.cfg.UDPPort,
-	})
+	}).String()
+	conn, err := netbind.ListenUDP(runCtx, "udp", listenAddr, s.cfg.IngressInterface)
 
 	if err != nil {
 		return err
@@ -326,8 +328,10 @@ func (s *Server) Run(ctx context.Context) error {
 	s.configureSocketBuffers(conn)
 
 	s.log.Infof(
-		"\U0001F4E1 <green>UDP Listener Ready, Addr: <cyan>%s</cyan>, Readers: <cyan>%d</cyan>, Workers: <cyan>%d</cyan>, Queue: <cyan>%d</cyan></green>",
+		"\U0001F4E1 <green>UDP Listener Ready, Addr: <cyan>%s</cyan>, IngressInterface: <cyan>%q</cyan>, EgressInterface: <cyan>%q</cyan>, Readers: <cyan>%d</cyan>, Workers: <cyan>%d</cyan>, Queue: <cyan>%d</cyan></green>",
 		s.cfg.Address(),
+		s.cfg.IngressInterface,
+		s.cfg.EgressInterface,
 		s.cfg.UDPReaders,
 		s.cfg.DNSRequestWorkers,
 		s.cfg.MaxConcurrentRequests,

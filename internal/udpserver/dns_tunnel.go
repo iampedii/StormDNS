@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -8,6 +8,7 @@
 package udpserver
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	DnsParser "stormdns-go/internal/dnsparser"
 	Enums "stormdns-go/internal/enums"
 	"stormdns-go/internal/inflight"
+	"stormdns-go/internal/netbind"
 )
 
 var ErrInvalidDNSUpstream = errors.New("invalid dns upstream")
@@ -379,7 +381,7 @@ func dnsUpstreamHedgeDelay(timeout time.Duration) time.Duration {
 // queryOneUpstream sends rawQuery to a single upstream DNS server and returns
 // the response. It is safe to call concurrently from multiple goroutines.
 func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time.Duration) ([]byte, error) {
-	conn, err := newUDPUpstreamConn(upstream)
+	conn, err := newUDPUpstreamConn(upstream, timeout, s.cfg.EgressInterface)
 	if err != nil {
 		return nil, err
 	}
@@ -416,17 +418,13 @@ func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time
 	return response, nil
 }
 
-func newUDPUpstreamConn(endpoint string) (*net.UDPConn, error) {
+func newUDPUpstreamConn(endpoint string, timeout time.Duration, interfaceName string) (*net.UDPConn, error) {
 	host, port, err := splitHostPortDefault53(endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
-	if err != nil {
-		return nil, err
-	}
-	return net.DialUDP("udp", nil, addr)
+	return netbind.DialUDP(context.Background(), net.JoinHostPort(host, port), timeout, interfaceName)
 }
 
 func splitHostPortDefault53(value string) (string, string, error) {

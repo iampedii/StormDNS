@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -32,6 +32,8 @@ SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 3]
 	cfg, err := LoadServerConfigWithOverrides(configPath, ServerConfigOverrides{
 		Values: map[string]any{
 			"UDPPort":                           5300,
+			"IngressInterface":                  "warp-ingress",
+			"EgressInterface":                   "warp-egress",
 			"Domain":                            []string{"flag.example.com", "alt.example.com"},
 			"DataEncryptionMethod":              2,
 			"SupportedUploadCompressionTypes":   []int{0, 1},
@@ -44,6 +46,12 @@ SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 3]
 
 	if cfg.UDPPort != 5300 {
 		t.Fatalf("unexpected udp port override: got=%d want=%d", cfg.UDPPort, 5300)
+	}
+	if cfg.IngressInterface != "warp-ingress" {
+		t.Fatalf("unexpected ingress interface override: got=%q", cfg.IngressInterface)
+	}
+	if cfg.EgressInterface != "warp-egress" {
+		t.Fatalf("unexpected egress interface override: got=%q", cfg.EgressInterface)
 	}
 	if len(cfg.Domain) != 2 || cfg.Domain[0] != "flag.example.com" || cfg.Domain[1] != "alt.example.com" {
 		t.Fatalf("unexpected domain override: %+v", cfg.Domain)
@@ -68,6 +76,8 @@ func TestServerConfigFlagBinderBuildsOverridesForSetFlagsOnly(t *testing.T) {
 
 	if err := fs.Parse([]string{
 		"-udp-port=5300",
+		"-ingress-interface=warp-in",
+		"-egress-interface=warp-out",
 		"-domain=a.example.com,b.example.com",
 		"-use-external-socks5",
 		"-supported-upload-compression-types=0,1",
@@ -79,6 +89,12 @@ func TestServerConfigFlagBinderBuildsOverridesForSetFlagsOnly(t *testing.T) {
 	overrides := binder.Overrides()
 	if got, ok := overrides.Values["UDPPort"].(int); !ok || got != 5300 {
 		t.Fatalf("unexpected udp port override: %#v", overrides.Values["UDPPort"])
+	}
+	if got, ok := overrides.Values["IngressInterface"].(string); !ok || got != "warp-in" {
+		t.Fatalf("unexpected ingress interface override: %#v", overrides.Values["IngressInterface"])
+	}
+	if got, ok := overrides.Values["EgressInterface"].(string); !ok || got != "warp-out" {
+		t.Fatalf("unexpected egress interface override: %#v", overrides.Values["EgressInterface"])
 	}
 	if got, ok := overrides.Values["UseExternalSOCKS5"].(bool); !ok || !got {
 		t.Fatalf("unexpected socks5 override: %#v", overrides.Values["UseExternalSOCKS5"])

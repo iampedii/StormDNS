@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -27,6 +27,8 @@ type ServerConfig struct {
 	ConfigDir                         string   `toml:"-"`
 	ConfigPath                        string   `toml:"-"`
 	ProtocolType                      string   `toml:"PROTOCOL_TYPE"`
+	IngressInterface                  string   `toml:"INGRESS_INTERFACE"`
+	EgressInterface                   string   `toml:"EGRESS_INTERFACE"`
 	UDPHost                           string   `toml:"UDP_HOST"`
 	UDPPort                           int      `toml:"UDP_PORT"`
 	UDPReaders                        int      `toml:"UDP_READERS"`
@@ -111,6 +113,8 @@ func defaultServerConfig() ServerConfig {
 
 	return ServerConfig{
 		ProtocolType:                      "SOCKS5",
+		IngressInterface:                  "",
+		EgressInterface:                   "",
 		UDPHost:                           "0.0.0.0",
 		UDPPort:                           53,
 		UDPReaders:                        readers,
@@ -228,6 +232,9 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	default:
 		return cfg, fmt.Errorf("invalid PROTOCOL_TYPE: %q", cfg.ProtocolType)
 	}
+
+	cfg.IngressInterface = strings.TrimSpace(cfg.IngressInterface)
+	cfg.EgressInterface = strings.TrimSpace(cfg.EgressInterface)
 
 	if cfg.UDPHost == "" {
 		cfg.UDPHost = "0.0.0.0"

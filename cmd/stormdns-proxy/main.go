@@ -21,6 +21,7 @@ import (
 	DnsParser "stormdns-go/internal/dnsparser"
 	domainMatcher "stormdns-go/internal/domainmatcher"
 	Enums "stormdns-go/internal/enums"
+	"stormdns-go/internal/netbind"
 	"stormdns-go/internal/runtimepath"
 	"stormdns-go/internal/security"
 	VpnProto "stormdns-go/internal/vpnproto"
@@ -135,6 +136,7 @@ func main() {
 	readers := flag.Int("readers", 0, "client UDP reader goroutines; default uses UDP_READERS from config")
 	workers := flag.Int("workers", 0, "client packet worker goroutines; default uses DNS_REQUEST_WORKERS from config")
 	queueDepth := flag.Int("queue", 0, "client packet queue depth; default uses MAX_CONCURRENT_REQUESTS from config")
+	ingressInterfaceFlag := flag.String("ingress-interface", "", "bind client UDP listener to a network interface; default uses INGRESS_INTERFACE from config")
 	flag.Parse()
 
 	cfg, err := config.LoadServerConfigWithOverrides(runtimepath.Resolve(*configPath), config.ServerConfigOverrides{})
@@ -166,6 +168,10 @@ func main() {
 	if clientQueueDepth < clientWorkers {
 		clientQueueDepth = clientWorkers
 	}
+	ingressInterface := netbind.NormalizeInterface(*ingressInterfaceFlag)
+	if ingressInterface == "" {
+		ingressInterface = cfg.IngressInterface
+	}
 
 	keyInfo, err := security.EnsureServerEncryptionKey(cfg)
 	if err != nil {
@@ -180,7 +186,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve listen addr: %v", err)
 	}
-	listener, err := net.ListenUDP("udp", udpAddr)
+	listener, err := netbind.ListenUDP(context.Background(), "udp", udpAddr.String(), ingressInterface)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *listenAddr, err)
 	}
@@ -225,8 +231,8 @@ func main() {
 	go p.statsLoop(ctx)
 
 	log.Printf(
-		"stormdns-proxy listening on %s with %d backends readers=%d workers=%d queue=%d socket-buffer=%d",
-		listener.LocalAddr(), len(backends), clientReaders, clientWorkers, clientQueueDepth, bufferSize,
+		"stormdns-proxy listening on %s ingress-interface=%q with %d backends readers=%d workers=%d queue=%d socket-buffer=%d",
+		listener.LocalAddr(), ingressInterface, len(backends), clientReaders, clientWorkers, clientQueueDepth, bufferSize,
 	)
 	p.serve(ctx)
 }

@@ -185,6 +185,8 @@ The script asks for the total number of backend containers, checks the required 
 sudo ./stormdns_god_mode.sh --instances 20 --yes
 ```
 
+For the full god-mode and WhiteDNS management walkthrough, see [`WHITEDNS_TUTORIAL.md`](WHITEDNS_TUTORIAL.md).
+
 #### Step 1.2.3: Important Notes After Installation
 
 - During installation, you will be asked for a domain. It must be the same delegated subdomain you configured in the `NS` record, for example `v.example.com`.
