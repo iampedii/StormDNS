@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+detect_root() {
+  local candidate
+  if [[ -n "${STORMDNS_ROOT:-}" ]]; then
+    printf '%s\n' "${STORMDNS_ROOT}"
+    return
+  fi
+
+  for candidate in "${SCRIPT_DIR}" "$(dirname "${SCRIPT_DIR}")" "/root/StormDNS"; do
+    if [[ -f "${candidate}/stormdns_god_mode.sh" || -f "${candidate}/server_config.toml" || -d "${candidate}/stormdns-docker" ]]; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+
+  printf '%s\n' "${SCRIPT_DIR}"
+}
+
+ROOT_DIR="$(detect_root)"
+ROOT_DIR="$(cd "${ROOT_DIR}" && pwd -P)"
+DOCKER_DIR="${STORMDNS_DOCKER_DIR:-${ROOT_DIR}/stormdns-docker}"
+DOCKER_CONFIG_DIR="${DOCKER_DIR}/config"
+HOST_CONFIG="${STORMDNS_CONFIG:-${ROOT_DIR}/server_config.toml}"
+KEY_FILE="${STORMDNS_KEY_FILE:-}"
+COMPOSE_FILE="${DOCKER_DIR}/docker-compose.yml"
+BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
+BACKUP_DIR=""
+
+PROXY_UNIT="stormdns-proxy.service"
+WATCHDOG_UNIT="stormdns-watchdog.service"
+WARP_UNIT="stormdns-warp-egress.service"
+
+print_banner() {
+  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+
+  cat <<'EOF'
+ __        ___     _ _       ____  _   _ ____
+ \ \      / / |__ (_) |_ ___|  _ \| \ | / ___|
+  \ \ /\ / /| '_ \| | __/ _ \ | | |  \| \___ \
+   \ V  V / | | | | | ||  __/ |_| | |\  |___) |
+    \_/\_/  |_| |_|_|\__\___|____/|_| \_|____/
+
+EOF
+}
+
+log() {
+  printf '[WhiteDNS] %s\n' "$*"
+}
+
+die() {
+  printf '[WhiteDNS] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "run as root: sudo ${0}"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+prompt_read() {
+  local prompt="$1"
+  local var_name="$2"
+  local answer=""
+
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "${prompt}" >/dev/tty
+    IFS= read -r answer </dev/tty || return 1
+  else
+    printf '%s' "${prompt}"
+    IFS= read -r answer || return 1
+  fi
+
+  printf -v "${var_name}" '%s' "${answer}"
+}
+
+pause() {
+  local unused
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '\nPress Enter to continue...' >/dev/tty
+    IFS= read -r unused </dev/tty || true
+  elif [[ -t 0 ]]; then
+    printf '\nPress Enter to continue...'
+    IFS= read -r unused || true
+  fi
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="$2"
+  local answer
+
+  while true; do
+    if [[ "${default}" == "yes" ]]; then
+      prompt_read "${prompt} [Y/n]: " answer || return 1
+      answer="${answer:-y}"
+    else
+      prompt_read "${prompt} [y/N]: " answer || return 1
+      answer="${answer:-n}"
+    fi
+
+    answer="$(trim "${answer}")"
+    answer="${answer//$'\r'/}"
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) printf 'Please answer yes or no.\n' ;;
+    esac
+  done
+}
+
+docker_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
+ensure_deployment() {
+  require_command docker
+  if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+    die "Docker Compose is missing"
+  fi
+  require_command systemctl
+  require_command sed
+  require_command awk
+  require_command od
+
+  [[ -f "${HOST_CONFIG}" ]] || die "missing ${HOST_CONFIG}; run stormdns_god_mode.sh first"
+  [[ -f "${COMPOSE_FILE}" ]] || die "missing ${COMPOSE_FILE}; run stormdns_god_mode.sh first"
+  [[ -d "${DOCKER_CONFIG_DIR}" ]] || die "missing ${DOCKER_CONFIG_DIR}; run stormdns_god_mode.sh first"
+
+  KEY_FILE="$(resolve_key_file)"
+}
+
+init_backup_dir() {
+  if [[ -z "${BACKUP_DIR}" ]]; then
+    BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%d%H%M%S)-whitedns"
+    mkdir -p "${BACKUP_DIR}"
+  fi
+}
+
+backup_file() {
+  local path="$1"
+  local target
+  [[ -e "${path}" ]] || return 0
+  init_backup_dir
+  target="${BACKUP_DIR}/${path#/}"
+  mkdir -p "$(dirname "${target}")"
+  cp -a "${path}" "${target}"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "${s}"
+}
+
+config_value() {
+  local file="$1"
+  local key="$2"
+  sed -n -E "s|^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]+)\"?.*|\\1|p" "${file}" | tail -n1 | xargs || true
+}
+
+config_dir() {
+  dirname "${HOST_CONFIG}"
+}
+
+resolve_key_file() {
+  local configured
+  if [[ -n "${KEY_FILE}" ]]; then
+    printf '%s\n' "${KEY_FILE}"
+    return
+  fi
+
+  configured="$(config_value "${HOST_CONFIG}" "ENCRYPTION_KEY_FILE")"
+  configured="${configured:-encrypt_key.txt}"
+  if [[ "${configured}" == /* ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s/%s\n' "$(config_dir)" "${configured}"
+  fi
+}
+
+required_key_length() {
+  local method="$1"
+  case "${method}" in
+    3) printf '16\n' ;;
+    4) printf '24\n' ;;
+    *) printf '32\n' ;;
+  esac
+}
+
+generate_key() {
+  local length="$1"
+  local bytes
+  bytes=$(((length + 1) / 2))
+  od -An -N "${bytes}" -tx1 /dev/urandom | tr -d ' \n' | cut -c1-"${length}"
+}
+
+set_toml_string() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" "${file}"
+  else
+    printf '%s = "%s"\n' "${key}" "${value}" >> "${file}"
+  fi
+}
+
+set_toml_number() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
+  else
+    printf '%s = %s\n' "${key}" "${value}" >> "${file}"
+  fi
+}
+
+set_toml_array_strings() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
+  else
+    printf '%s = %s\n' "${key}" "${value}" >> "${file}"
+  fi
+}
+
+domain_values() {
+  local file="$1"
+  sed -n -E 's|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[(.*)\].*|\1|p' "${file}" |
+    grep -oE '"[^"]+"' |
+    sed -E 's/^"//; s/"$//' || true
+}
+
+domains_literal_from_values() {
+  local item out
+  out=""
+  for item in "$@"; do
+    [[ -n "${item}" ]] || continue
+    [[ "${item}" =~ ^[A-Za-z0-9*._-]+$ ]] || die "invalid domain: ${item}"
+    if [[ -n "${out}" ]]; then
+      out+=", "
+    fi
+    out+="\"${item}\""
+  done
+  [[ -n "${out}" ]] || die "at least one domain is required"
+  printf '[%s]\n' "${out}"
+}
+
+domains_literal_for_display() {
+  if [[ "$#" -eq 0 ]]; then
+    printf '[]\n'
+    return
+  fi
+  domains_literal_from_values "$@"
+}
+
+append_domains_to_config() {
+  local raw="$1"
+  local item key literal
+  local -a current=()
+  local -a additions=()
+  local -A seen=()
+
+  while IFS= read -r item; do
+    [[ -n "${item}" ]] || continue
+    current+=("${item}")
+    key="${item%.}"
+    seen["${key,,}"]=1
+  done < <(domain_values "${HOST_CONFIG}")
+
+  IFS=',' read -r -a additions <<< "${raw}"
+  for item in "${additions[@]}"; do
+    item="$(trim "${item}")"
+    [[ -n "${item}" ]] || continue
+    [[ "${item}" =~ ^[A-Za-z0-9*._-]+$ ]] || die "invalid domain: ${item}"
+    key="${item%.}"
+    key="${key,,}"
+    if [[ -z "${seen[${key}]:-}" ]]; then
+      current+=("${item}")
+      seen["${key}"]=1
+    fi
+  done
+
+  literal="$(domains_literal_from_values "${current[@]}")"
+  backup_file "${HOST_CONFIG}"
+  set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
+  log "Configured DOMAIN = ${literal}"
+}
+
+sync_config_to_docker() {
+  [[ -f "${KEY_FILE}" ]] || die "missing encryption key file: ${KEY_FILE}"
+
+  log "Syncing config and key into Docker project"
+  backup_file "${DOCKER_CONFIG_DIR}/server_config.toml"
+  backup_file "${DOCKER_CONFIG_DIR}/encrypt_key.txt"
+
+  cp -a "${HOST_CONFIG}" "${DOCKER_CONFIG_DIR}/server_config.toml"
+  cp -a "${KEY_FILE}" "${DOCKER_CONFIG_DIR}/encrypt_key.txt"
+  chmod 600 "${DOCKER_CONFIG_DIR}/encrypt_key.txt"
+
+  set_toml_string "${DOCKER_CONFIG_DIR}/server_config.toml" "UDP_HOST" "0.0.0.0"
+  set_toml_number "${DOCKER_CONFIG_DIR}/server_config.toml" "UDP_PORT" "53"
+  set_toml_string "${DOCKER_CONFIG_DIR}/server_config.toml" "ENCRYPTION_KEY_FILE" "/config/encrypt_key.txt"
+}
+
+systemd_unit_exists() {
+  local unit="$1"
+  systemctl list-unit-files --all "${unit}" 2>/dev/null | awk '{print $1}' | grep -Fxq "${unit}"
+}
+
+restart_unit_if_exists() {
+  local unit="$1"
+  if systemd_unit_exists "${unit}"; then
+    log "Restarting ${unit}"
+    systemctl restart "${unit}" || log "Warning: failed to restart ${unit}"
+  fi
+}
+
+stop_unit_if_exists() {
+  local unit="$1"
+  if systemd_unit_exists "${unit}"; then
+    log "Stopping ${unit}"
+    systemctl stop "${unit}" || log "Warning: failed to stop ${unit}"
+  fi
+}
+
+ensure_restart_policy() {
+  local container
+  while IFS= read -r container; do
+    [[ -n "${container}" ]] || continue
+    docker update --restart unless-stopped "${container}" >/dev/null || true
+  done < <(docker ps -a --filter 'name=^stormdns-[0-9]+$' --format '{{.Names}}' 2>/dev/null || true)
+}
+
+apply_to_all_containers() {
+  local -a args=(up -d --build --force-recreate --remove-orphans)
+
+  log "Reloading Docker containers from current config"
+  (cd "${DOCKER_DIR}" && docker_compose "${args[@]}")
+  ensure_restart_policy
+
+  restart_unit_if_exists "${WARP_UNIT}"
+  restart_unit_if_exists "${PROXY_UNIT}"
+  restart_unit_if_exists "${WATCHDOG_UNIT}"
+}
+
+restart_containers() {
+  BACKUP_DIR=""
+  sync_config_to_docker
+  apply_to_all_containers
+  log "Containers restarted"
+}
+
+stop_containers() {
+  ask_yes_no "Stop StormDNS containers and related services?" "no" || {
+    log "No changes made"
+    return
+  }
+
+  stop_unit_if_exists "${WATCHDOG_UNIT}"
+  stop_unit_if_exists "${PROXY_UNIT}"
+  stop_unit_if_exists "${WARP_UNIT}"
+
+  log "Stopping Docker containers"
+  (cd "${DOCKER_DIR}" && docker_compose stop)
+  log "Containers stopped"
+}
+
+update_encryption_key() {
+  local method method_name required new_key key_dir
+
+  method="$(config_value "${HOST_CONFIG}" "DATA_ENCRYPTION_METHOD")"
+  method="${method:-1}"
+  method_name="$(encryption_method_name "${method}")"
+  required="$(required_key_length "${method}")"
+
+  printf '\nCurrent encryption method: %s (%s)\n' "${method}" "${method_name}"
+  printf 'Required key length: %s characters\n' "${required}"
+  ask_yes_no "Apply a new encryption key and reload all containers? Clients must be updated too." "no" || {
+    log "No changes made"
+    return
+  }
+
+  while true; do
+    prompt_read "Enter new key, or press Enter to generate one: " new_key || return
+    new_key="${new_key//[[:space:]]/}"
+    if [[ -z "${new_key}" ]]; then
+      new_key="$(generate_key "${required}")"
+      break
+    fi
+    if [[ "${#new_key}" -eq "${required}" ]]; then
+      break
+    fi
+    printf 'Key must be exactly %s characters for DATA_ENCRYPTION_METHOD=%s.\n' "${required}" "${method}"
+  done
+
+  BACKUP_DIR=""
+  backup_file "${KEY_FILE}"
+  key_dir="$(dirname "${KEY_FILE}")"
+  mkdir -p "${key_dir}"
+  printf '%s' "${new_key}" > "${KEY_FILE}"
+  chmod 600 "${KEY_FILE}"
+  log "Updated encryption key at ${KEY_FILE}"
+
+  sync_config_to_docker
+  apply_to_all_containers
+  print_connection_summary
+}
+
+add_new_domain() {
+  local domains
+  local -a domain_list=()
+
+  mapfile -t domain_list < <(domain_values "${HOST_CONFIG}")
+  printf '\nCurrent DOMAIN = %s\n' "$(domains_literal_for_display "${domain_list[@]}")"
+  prompt_read "Enter additional tunnel domain(s), comma-separated: " domains || return
+  domains="$(trim "${domains}")"
+  if [[ -z "${domains}" ]]; then
+    log "No changes made"
+    return
+  fi
+
+  BACKUP_DIR=""
+  append_domains_to_config "${domains}"
+  sync_config_to_docker
+  apply_to_all_containers
+  print_connection_summary
+}
+
+encryption_method_name() {
+  local method="$1"
+  case "${method}" in
+    0) printf 'NONE\n' ;;
+    1) printf 'XOR\n' ;;
+    2) printf 'ChaCha20\n' ;;
+    3) printf 'AES-128-GCM\n' ;;
+    4) printf 'AES-192-GCM\n' ;;
+    5) printf 'AES-256-GCM\n' ;;
+    *) printf 'UNKNOWN\n' ;;
+  esac
+}
+
+unit_state() {
+  local unit="$1"
+  local active enabled
+  if ! systemd_unit_exists "${unit}"; then
+    printf 'missing\n'
+    return
+  fi
+
+  active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+  enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+  printf '%s/%s\n' "${active:-unknown}" "${enabled:-unknown}"
+}
+
+print_connection_summary() {
+  local method method_name key domains
+  local -a domain_list=()
+
+  method="$(config_value "${HOST_CONFIG}" "DATA_ENCRYPTION_METHOD")"
+  method="${method:-1}"
+  method_name="$(encryption_method_name "${method}")"
+  key="$(tr -d '[:space:]' < "${KEY_FILE}" 2>/dev/null || true)"
+  mapfile -t domain_list < <(domain_values "${HOST_CONFIG}")
+  domains="$(domains_literal_for_display "${domain_list[@]}")"
+
+  cat <<EOF
+
+StormDNS client values:
+  DOMAIN = ${domains}
+  DATA_ENCRYPTION_METHOD = ${method} (${method_name})
+  ENCRYPTION_KEY = ${key}
+  ENCRYPTION_SECRET = ${key}
+
+EOF
+}
+
+show_config() {
+  local method method_name domains key
+  local -a domain_list=()
+
+  method="$(config_value "${HOST_CONFIG}" "DATA_ENCRYPTION_METHOD")"
+  method="${method:-1}"
+  method_name="$(encryption_method_name "${method}")"
+  key="$(tr -d '[:space:]' < "${KEY_FILE}" 2>/dev/null || true)"
+  mapfile -t domain_list < <(domain_values "${HOST_CONFIG}")
+  domains="$(domains_literal_for_display "${domain_list[@]}")"
+
+  cat <<EOF
+WhiteDNS deployment:
+  Root:          ${ROOT_DIR}
+  Docker dir:    ${DOCKER_DIR}
+  Host config:   ${HOST_CONFIG}
+  Docker config: ${DOCKER_CONFIG_DIR}/server_config.toml
+  Key file:      ${KEY_FILE}
+
+StormDNS client values:
+  DOMAIN = ${domains}
+  DATA_ENCRYPTION_METHOD = ${method} (${method_name})
+  ENCRYPTION_KEY = ${key}
+  ENCRYPTION_SECRET = ${key}
+
+Services:
+  ${PROXY_UNIT}:    $(unit_state "${PROXY_UNIT}")
+  ${WATCHDOG_UNIT}: $(unit_state "${WATCHDOG_UNIT}")
+  ${WARP_UNIT}:     $(unit_state "${WARP_UNIT}")
+
+Containers:
+EOF
+  (cd "${DOCKER_DIR}" && docker_compose ps) || true
+}
+
+print_menu() {
+  cat <<'EOF'
+Select an option:
+  0 -> Restart Containers
+  2 -> Stop containers
+  3 -> Update encryption Key
+  4 -> Add new domain
+  5 -> Show config
+  6 -> Exit
+
+EOF
+}
+
+main() {
+  local choice
+
+  print_banner
+  require_root
+  ensure_deployment
+
+  while true; do
+    print_menu
+    prompt_read "Choice: " choice || exit 0
+    choice="$(trim "${choice}")"
+
+    case "${choice}" in
+      0)
+        restart_containers
+        pause
+        ;;
+      2)
+        stop_containers
+        pause
+        ;;
+      3)
+        update_encryption_key
+        pause
+        ;;
+      4)
+        add_new_domain
+        pause
+        ;;
+      5)
+        show_config
+        pause
+        ;;
+      6)
+        log "Exit"
+        exit 0
+        ;;
+      *)
+        printf 'Invalid option: %s\n' "${choice}"
+        pause
+        ;;
+    esac
+
+    print_banner
+  done
+}
+
+main "$@"
