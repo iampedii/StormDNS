@@ -1034,6 +1034,108 @@ check_port53_conflict() {
   return 1
 }
 
+port53_owners() {
+  ss -H -lunp 'sport = :53' 2>/dev/null | grep -v 'stormdns-proxy' || true
+}
+
+port53_pids() {
+  port53_owners | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u
+}
+
+stop_socket_if_present() {
+  local unit="$1"
+  if systemctl list-unit-files --type=socket --all 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"; then
+    systemctl stop "${unit}" >/dev/null 2>&1 || true
+    systemctl disable "${unit}" >/dev/null 2>&1 || true
+  fi
+}
+
+stop_service_if_present() {
+  local unit="$1"
+  if systemctl list-unit-files --type=service --all 2>/dev/null | awk '{print $1}' | grep -qx "${unit}"; then
+    systemctl stop "${unit}" >/dev/null 2>&1 || true
+    systemctl disable "${unit}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+  fi
+}
+
+disable_systemd_resolved_stub() {
+  if [[ -f /etc/systemd/resolved.conf ]]; then
+    backup_file /etc/systemd/resolved.conf "${BACKUP_DIR}"
+    if grep -q '^#\?DNSStubListener=' /etc/systemd/resolved.conf; then
+      sed -i -E 's/^#?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
+    else
+      printf '\nDNSStubListener=no\n' >> /etc/systemd/resolved.conf
+    fi
+    if ! grep -q '^DNS=' /etc/systemd/resolved.conf; then
+      printf 'DNS=1.1.1.1 8.8.8.8\n' >> /etc/systemd/resolved.conf
+    fi
+  fi
+
+  systemctl restart systemd-resolved >/dev/null 2>&1 || true
+  stop_socket_if_present systemd-resolved.socket
+}
+
+terminate_pid() {
+  local pid="$1"
+  local cmdline
+  [[ -n "${pid}" ]] || return 0
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  cmdline="$(ps -p "${pid}" -o cmd= 2>/dev/null || true)"
+  if grep -qi 'stormdns-proxy' <<< "${cmdline}"; then
+    return 0
+  fi
+
+  log "Stopping UDP/53 PID ${pid}: ${cmdline:-unknown}"
+  kill "${pid}" 2>/dev/null || true
+  for _ in 1 2 3; do
+    sleep 1
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  log "PID ${pid} did not stop; sending SIGKILL"
+  kill -9 "${pid}" 2>/dev/null || true
+}
+
+release_port53_conflict() {
+  local owners pid
+  owners="$(port53_owners)"
+  [[ -z "${owners}" ]] && return 0
+
+  log "UDP/53 is already in use by:"
+  printf '%s\n' "${owners}" >&2
+
+  if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
+    die "UDP port 53 is already owned by another process"
+  fi
+
+  ask_yes_no "Stop/disable these UDP/53 owner(s) and continue?" "no" || die "UDP port 53 is already owned by another process"
+
+  if grep -q 'systemd-resolve' <<< "${owners}"; then
+    log "Disabling systemd-resolved DNS stub listener"
+    disable_systemd_resolved_stub
+  fi
+
+  for unit in bind9.service named.service dnsmasq.service unbound.service pdns.service dnscrypt-proxy.service smartdns.service coredns.service; do
+    stop_service_if_present "${unit}"
+  done
+  stop_socket_if_present dnsmasq.socket
+
+  while IFS= read -r pid; do
+    terminate_pid "${pid}"
+  done < <(port53_pids)
+
+  owners="$(port53_owners)"
+  if [[ -n "${owners}" ]]; then
+    printf '%s\n' "${owners}" >&2
+    die "UDP port 53 is still owned by another process after cleanup"
+  fi
+}
+
 start_stack() {
   local build="$1"
   local recreate="$2"
@@ -1304,9 +1406,7 @@ log "Backend list: ${BACKENDS}"
 
 disable_legacy_services
 stop_unit_hard stormdns-proxy.service
-if ! check_port53_conflict; then
-  die "UDP port 53 is already owned by another process; stop it and rerun"
-fi
+release_port53_conflict
 write_proxy_unit "${BACKENDS}"
 if [[ "${WARP_EGRESS}" == "yes" ]]; then
   write_warp_egress_script
