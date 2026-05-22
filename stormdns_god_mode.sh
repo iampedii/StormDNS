@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ROOT_DIR="${STORMDNS_ROOT:-${SCRIPT_DIR}}"
-SOURCE_DIR="${STORMDNS_SOURCE_DIR:-${SCRIPT_DIR}}"
+ROOT_DIR="${STORMDNS_ROOT:-}"
+SOURCE_DIR="${STORMDNS_SOURCE_DIR:-}"
 DOCKER_DIR="${STORMDNS_DOCKER_DIR:-}"
 DOCKER_CONFIG_DIR=""
 HOST_CONFIG="${STORMDNS_CONFIG:-}"
@@ -12,7 +12,11 @@ SERVER_BIN="${STORMDNS_SERVER_BIN:-}"
 PROXY_BIN="${STORMDNS_PROXY_BIN:-}"
 COMPOSE_FILE=""
 DOCKERFILE=""
+WARP_EGRESS_SCRIPT=""
 PROXY_UNIT="/etc/systemd/system/stormdns-proxy.service"
+WARP_EGRESS_UNIT="/etc/systemd/system/stormdns-warp-egress.service"
+SYSCTL_FILE="/etc/sysctl.d/99-stormdns.conf"
+LIMITS_FILE="/etc/security/limits.d/99-stormdns.conf"
 BACKUP_ROOT=""
 
 NETWORK_NAME="stormdns_net"
@@ -27,9 +31,12 @@ PROXY_TIMEOUT="4s"
 
 INSTANCES=""
 BUILD="yes"
+BINARY_BUILD="yes"
 RECREATE="yes"
 NON_INTERACTIVE="no"
-ASSUME_YES="no"
+CONFIRM="no"
+WARP_EGRESS="yes"
+REGENERATE_KEY="no"
 
 usage() {
   cat <<EOF
@@ -41,8 +48,9 @@ Options:
   --instances N           Number of StormDNS backend containers.
   --root DIR              StormDNS install directory. Default: script directory.
   --docker-dir DIR        Docker project directory. Default: ROOT/stormdns-docker.
-  --server-bin PATH       StormDNS server binary. Auto-detected by default.
-  --proxy-bin PATH        StormDNS proxy binary. Auto-detected by default.
+  --source-dir DIR        Go source tree. Auto-detected by default.
+  --server-bin PATH       StormDNS server binary. Used when source build is disabled/unavailable.
+  --proxy-bin PATH        StormDNS proxy binary. Used when source build is disabled/unavailable.
   --config PATH           Host server_config.toml. Default: ROOT/server_config.toml.
   --key PATH              Host encrypt_key.txt. Default: config ENCRYPTION_KEY_FILE.
   --listen ADDR           Proxy listen address. Default: ${LISTEN_ADDR}.
@@ -50,10 +58,14 @@ Options:
   --session-ttl DURATION  Proxy session route TTL. Default: ${SESSION_TTL}.
   --busy-cooldown DUR     Backend cooldown after SESSION_BUSY. Default: ${BUSY_COOLDOWN}.
   --timeout DURATION      Backend response timeout. Default: ${PROXY_TIMEOUT}.
+  --no-source-build       Do not build stormdns-server/proxy from local Go source.
   --no-build              Do not rebuild the Docker image.
   --no-recreate           Do not force recreate containers.
+  --no-warp-egress        Do not install/restart WARP egress routing helper.
+  --regenerate-key        Replace an invalid existing encryption key without prompting.
+  --confirm               Ask for confirmation before changing files/services.
   --non-interactive       Use defaults and fail instead of prompting.
-  -y, --yes               Do not ask for final confirmation.
+  -y, --yes               Accepted for compatibility; god mode does not confirm by default.
   -h, --help              Show this help.
 EOF
 }
@@ -264,7 +276,7 @@ generate_key() {
 }
 
 ensure_key_file() {
-  local method required existing answer generated key_dir
+  local method required existing generated key_dir
   method="$(config_value "${HOST_CONFIG}" "DATA_ENCRYPTION_METHOD")"
   method="${method:-1}"
   required="$(required_key_length "${method}")"
@@ -279,30 +291,17 @@ ensure_key_file() {
       return
     fi
     log "Existing key has length ${#existing}; expected ${required} for DATA_ENCRYPTION_METHOD=${method}"
-    if ! ask_yes_no "Replace ${KEY_FILE} with a new generated key?" "no"; then
-      die "valid encryption key is required"
-    fi
-  elif ! ask_yes_no "Generate encryption key at ${KEY_FILE}?" "yes"; then
-    while true; do
-      prompt_read "Enter encryption key (${required} characters): " answer
-      answer="$(trim "${answer}")"
-      if [[ "${#answer}" -eq "${required}" ]]; then
-        printf '%s' "${answer}" > "${KEY_FILE}"
-        chmod 600 "${KEY_FILE}"
-        return
-      fi
-      printf 'Key must be exactly %s characters.\n' "${required}"
-    done
+    [[ "${REGENERATE_KEY}" == "yes" ]] || die "valid encryption key is required; fix ${KEY_FILE} or rerun with --regenerate-key"
   fi
 
   require_command od
   generated="$(generate_key "${required}")"
   printf '%s' "${generated}" > "${KEY_FILE}"
   chmod 600 "${KEY_FILE}"
+  log "Generated encryption key at ${KEY_FILE}"
 }
 
 ensure_config() {
-  local domains literal
   if [[ ! -f "${HOST_CONFIG}" && -f "${ROOT_DIR}/server_config.toml.simple" ]]; then
     cp -a "${ROOT_DIR}/server_config.toml.simple" "${HOST_CONFIG}"
     log "Created ${HOST_CONFIG} from server_config.toml.simple"
@@ -310,17 +309,7 @@ ensure_config() {
   require_file "${HOST_CONFIG}"
 
   if grep -Eq '^[[:space:]]*DOMAIN[[:space:]]*=.*v\.domain\.com|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[[[:space:]]*\]' "${HOST_CONFIG}"; then
-    if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
-      die "DOMAIN must be configured in ${HOST_CONFIG}"
-    fi
-    while true; do
-      prompt_read "Enter tunnel domain(s), comma-separated (example: v.example.com): " domains
-      domains="$(trim "${domains}")"
-      [[ -n "${domains}" ]] || continue
-      literal="$(domain_array_literal "${domains}")"
-      set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
-      break
-    done
+    die "DOMAIN must be configured in ${HOST_CONFIG} before god mode runs"
   fi
 
   ensure_key_file
@@ -335,6 +324,42 @@ first_existing_binary() {
     fi
   done
   return 1
+}
+
+detect_install_root() {
+  if [[ -n "${ROOT_DIR}" ]]; then
+    printf '%s\n' "${ROOT_DIR}"
+    return
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/go.mod" && -f "$(dirname "${SCRIPT_DIR}")/server_config.toml" ]]; then
+    dirname "${SCRIPT_DIR}"
+    return
+  fi
+
+  printf '%s\n' "${SCRIPT_DIR}"
+}
+
+source_tree_ready() {
+  local dir="$1"
+  [[ -n "${dir}" ]] || return 1
+  [[ -f "${dir}/go.mod" && -f "${dir}/cmd/server/main.go" && -f "${dir}/cmd/stormdns-proxy/main.go" ]]
+}
+
+detect_source_dir() {
+  local candidate
+  if [[ -n "${SOURCE_DIR}" ]]; then
+    source_tree_ready "${SOURCE_DIR}" || die "source tree is incomplete: ${SOURCE_DIR}"
+    printf '%s\n' "${SOURCE_DIR}"
+    return
+  fi
+
+  for candidate in "${ROOT_DIR}/StormDNS" "${SCRIPT_DIR}" "/root/StormDNS"; do
+    if source_tree_ready "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
 }
 
 detect_server_bin() {
@@ -363,19 +388,25 @@ detect_proxy_bin() {
   first_existing_binary "${candidates[@]}"
 }
 
-build_proxy_from_source() {
+build_binaries_from_source() {
   local source_dir="$1"
-  local out="$2"
-  if [[ ! -d "${source_dir}/cmd/stormdns-proxy" || ! -f "${source_dir}/go.mod" ]]; then
+  local build_dir
+  if ! source_tree_ready "${source_dir}"; then
     return 1
   fi
   require_command go
-  log "Building stormdns-proxy from source: ${source_dir}"
+  build_dir="$(mktemp -d /tmp/stormdns-god-build.XXXXXX)"
+  log "Building stormdns-server and stormdns-proxy from source: ${source_dir}"
   (
     cd "${source_dir}"
-    GOCACHE="${GOCACHE:-/tmp/stormdns-gocache}" GOTMPDIR="${GOTMPDIR:-/tmp}" go build -o "${out}" ./cmd/stormdns-proxy
+    GOCACHE="${GOCACHE:-/tmp/stormdns-gocache}" GOTMPDIR="${GOTMPDIR:-/tmp}" go build -o "${build_dir}/stormdns-server" ./cmd/server
+    GOCACHE="${GOCACHE:-/tmp/stormdns-gocache}" GOTMPDIR="${GOTMPDIR:-/tmp}" go build -o "${build_dir}/stormdns-proxy" ./cmd/stormdns-proxy
   )
-  chmod 755 "${out}"
+  install_runtime_binary "${build_dir}/stormdns-server" "${ROOT_DIR}/stormdns-server"
+  install_runtime_binary "${build_dir}/stormdns-proxy" "${ROOT_DIR}/stormdns-proxy"
+  rm -rf "${build_dir}"
+  SERVER_BIN="${ROOT_DIR}/stormdns-server"
+  PROXY_BIN="${ROOT_DIR}/stormdns-proxy"
 }
 
 install_runtime_binary() {
@@ -395,14 +426,17 @@ install_runtime_binary() {
 }
 
 resolve_binaries() {
+  if [[ "${BINARY_BUILD}" == "yes" && -n "${SOURCE_DIR}" ]]; then
+    if build_binaries_from_source "${SOURCE_DIR}"; then
+      return
+    fi
+  fi
+
   if [[ -z "${SERVER_BIN}" ]]; then
     SERVER_BIN="$(detect_server_bin || true)"
   fi
   if [[ -z "${PROXY_BIN}" ]]; then
     PROXY_BIN="$(detect_proxy_bin || true)"
-  fi
-  if [[ -z "${PROXY_BIN}" ]] && build_proxy_from_source "${SOURCE_DIR}" "${ROOT_DIR}/stormdns-proxy"; then
-    PROXY_BIN="${ROOT_DIR}/stormdns-proxy"
   fi
   [[ -n "${SERVER_BIN}" ]] || die "StormDNS server binary not found; pass --server-bin"
   [[ -n "${PROXY_BIN}" ]] || die "StormDNS proxy binary not found; pass --proxy-bin"
@@ -581,6 +615,309 @@ WantedBy=multi-user.target
 EOF
 }
 
+write_warp_egress_script() {
+  cat > "${WARP_EGRESS_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOCKER_SUBNET="${STORMDNS_DOCKER_SUBNET:-172.30.0.0/24}"
+WARP_IFACE="${STORMDNS_WARP_IFACE:-}"
+ROUTE_TABLE="${STORMDNS_WARP_TABLE:-53053}"
+RULE_PRIORITY="${STORMDNS_WARP_RULE_PRIORITY:-10530}"
+STRICT="${STORMDNS_WARP_STRICT:-0}"
+STATE_FILE="${STORMDNS_WARP_STATE:-/run/stormdns-warp-egress.env}"
+
+log() {
+  printf '[stormdns-warp-egress] %s\n' "$*"
+}
+
+die() {
+  printf '[stormdns-warp-egress] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "run as root"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+maybe_noop() {
+  local reason="$1"
+  if [[ "${STRICT}" == "1" ]]; then
+    die "${reason}"
+  fi
+  log "${reason}; no-op"
+  exit 0
+}
+
+iface_exists() {
+  [[ -n "$1" ]] && ip link show dev "$1" >/dev/null 2>&1
+}
+
+detect_warp_iface() {
+  local candidate name
+  if [[ -n "${WARP_IFACE}" ]]; then
+    iface_exists "${WARP_IFACE}" && printf '%s\n' "${WARP_IFACE}"
+    return
+  fi
+
+  for candidate in warp0 wgcf CloudflareWARP cloudflare-warp wg0; do
+    if iface_exists "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+
+  while IFS= read -r name; do
+    case "${name,,}" in
+      *warp*|wgcf*)
+        if iface_exists "${name}"; then
+          printf '%s\n' "${name}"
+          return
+        fi
+        ;;
+    esac
+  done < <(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }')
+}
+
+detect_docker_bridge() {
+  ip -o route show "${DOCKER_SUBNET}" 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+iptables_ensure_append() {
+  local table="$1"
+  local chain="$2"
+  shift 2
+  if ! iptables -t "${table}" -C "${chain}" "$@" >/dev/null 2>&1; then
+    iptables -t "${table}" -A "${chain}" "$@"
+  fi
+}
+
+iptables_ensure_insert_first() {
+  local table="$1"
+  local chain="$2"
+  shift 2
+  if ! iptables -t "${table}" -C "${chain}" "$@" >/dev/null 2>&1; then
+    iptables -t "${table}" -I "${chain}" 1 "$@"
+  fi
+}
+
+iptables_delete_all() {
+  local table="$1"
+  local chain="$2"
+  shift 2
+  while iptables -t "${table}" -C "${chain}" "$@" >/dev/null 2>&1; do
+    iptables -t "${table}" -D "${chain}" "$@" || break
+  done
+}
+
+apply_routes() {
+  local warp_iface docker_bridge
+  warp_iface="$(detect_warp_iface || true)"
+  [[ -n "${warp_iface}" ]] || maybe_noop "no WARP interface found"
+
+  docker_bridge="$(detect_docker_bridge || true)"
+  [[ -n "${docker_bridge}" ]] || maybe_noop "no route found for Docker subnet ${DOCKER_SUBNET}"
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  ip route replace "${DOCKER_SUBNET}" dev "${docker_bridge}" scope link table "${ROUTE_TABLE}"
+  ip route replace default dev "${warp_iface}" table "${ROUTE_TABLE}"
+
+  if ! ip rule show | grep -Eq "from ${DOCKER_SUBNET//./\\.} .* lookup ${ROUTE_TABLE}\$"; then
+    ip rule add priority "${RULE_PRIORITY}" from "${DOCKER_SUBNET}" lookup "${ROUTE_TABLE}"
+  fi
+
+  iptables_ensure_insert_first raw PREROUTING -s "${DOCKER_SUBNET}" -p udp --dport 53 -m comment --comment stormdns-warp-egress -j RETURN
+  iptables_ensure_append nat POSTROUTING -s "${DOCKER_SUBNET}" -o "${warp_iface}" -m comment --comment stormdns-warp-egress -j MASQUERADE
+  iptables_ensure_append filter FORWARD -s "${DOCKER_SUBNET}" -o "${warp_iface}" -m comment --comment stormdns-warp-egress -j ACCEPT
+  iptables_ensure_append filter FORWARD -d "${DOCKER_SUBNET}" -i "${warp_iface}" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment stormdns-warp-egress -j ACCEPT
+
+  mkdir -p "$(dirname "${STATE_FILE}")"
+  {
+    printf 'DOCKER_SUBNET=%q\n' "${DOCKER_SUBNET}"
+    printf 'WARP_IFACE=%q\n' "${warp_iface}"
+    printf 'DOCKER_BRIDGE=%q\n' "${docker_bridge}"
+    printf 'ROUTE_TABLE=%q\n' "${ROUTE_TABLE}"
+    printf 'RULE_PRIORITY=%q\n' "${RULE_PRIORITY}"
+  } > "${STATE_FILE}"
+
+  log "enabled Docker subnet ${DOCKER_SUBNET} egress via ${warp_iface} table=${ROUTE_TABLE} bridge=${docker_bridge}"
+}
+
+clear_routes() {
+  local warp_iface="${WARP_IFACE}"
+  local subnet="${DOCKER_SUBNET}"
+  local table="${ROUTE_TABLE}"
+  local priority="${RULE_PRIORITY}"
+
+  if [[ -r "${STATE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${STATE_FILE}"
+    warp_iface="${WARP_IFACE:-${warp_iface}}"
+    subnet="${DOCKER_SUBNET:-${subnet}}"
+    table="${ROUTE_TABLE:-${table}}"
+    priority="${RULE_PRIORITY:-${priority}}"
+  fi
+
+  iptables_delete_all raw PREROUTING -s "${subnet}" -p udp --dport 53 -m comment --comment stormdns-warp-egress -j RETURN
+
+  if [[ -n "${warp_iface}" ]]; then
+    iptables_delete_all nat POSTROUTING -s "${subnet}" -o "${warp_iface}" -m comment --comment stormdns-warp-egress -j MASQUERADE
+    iptables_delete_all filter FORWARD -s "${subnet}" -o "${warp_iface}" -m comment --comment stormdns-warp-egress -j ACCEPT
+    iptables_delete_all filter FORWARD -d "${subnet}" -i "${warp_iface}" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment stormdns-warp-egress -j ACCEPT
+  fi
+
+  while ip rule show | grep -Eq "^[0-9]+:[[:space:]]+from ${subnet//./\\.} .* lookup ${table}\$"; do
+    ip rule del priority "${priority}" from "${subnet}" lookup "${table}" >/dev/null 2>&1 || break
+  done
+  ip route flush table "${table}" >/dev/null 2>&1 || true
+  rm -f "${STATE_FILE}"
+  log "cleared Docker subnet ${subnet} WARP egress routing"
+}
+
+show_status() {
+  log "interfaces matching WARP candidates:"
+  ip -br link | awk 'tolower($1) ~ /warp|wgcf/ { print }' || true
+  log "policy rules:"
+  ip rule show | grep -E "from ${DOCKER_SUBNET//./\\.}|lookup ${ROUTE_TABLE}" || true
+  log "table ${ROUTE_TABLE}:"
+  ip route show table "${ROUTE_TABLE}" 2>/dev/null || true
+  log "raw PREROUTING StormDNS exceptions:"
+  iptables -t raw -S PREROUTING | grep -F "stormdns-warp-egress" || true
+  log "nat POSTROUTING WARP MASQUERADE:"
+  iptables -t nat -S POSTROUTING | grep -F "stormdns-warp-egress" || true
+}
+
+main() {
+  local action="${1:-apply}"
+  require_root
+  require_command ip
+  require_command iptables
+  case "${action}" in
+    apply)
+      apply_routes
+      ;;
+    clear)
+      clear_routes
+      ;;
+    status)
+      show_status
+      ;;
+    *)
+      die "usage: $0 [apply|clear|status]"
+      ;;
+  esac
+}
+
+main "$@"
+EOF
+  chmod 755 "${WARP_EGRESS_SCRIPT}"
+}
+
+write_warp_egress_unit() {
+  local docker_unit after_line wants_line requires_line
+  docker_unit="$(detect_docker_systemd_unit || true)"
+  after_line="After=network-online.target warp-svc.service"
+  wants_line="Wants=network-online.target"
+  requires_line=""
+  if [[ -n "${docker_unit}" ]]; then
+    after_line="After=network-online.target ${docker_unit} warp-svc.service"
+    requires_line="Requires=${docker_unit}"
+  fi
+
+  cat > "${WARP_EGRESS_UNIT}" <<EOF
+[Unit]
+Description=StormDNS Docker backend WARP egress routing
+${after_line}
+${wants_line}
+${requires_line}
+Before=stormdns-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=STORMDNS_DOCKER_SUBNET=${SUBNET}
+Environment=STORMDNS_WARP_TABLE=53053
+Environment=STORMDNS_WARP_RULE_PRIORITY=10530
+Environment=STORMDNS_WARP_STRICT=0
+ExecStart=${WARP_EGRESS_SCRIPT} apply
+ExecStop=${WARP_EGRESS_SCRIPT} clear
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+apply_os_tuning() {
+  cat > "${SYSCTL_FILE}" <<'EOF'
+# StormDNS high-rate UDP tuning
+fs.file-max = 2097152
+fs.nr_open = 2097152
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 250000
+net.core.optmem_max = 25165824
+net.core.rmem_default = 67108864
+net.core.wmem_default = 67108864
+net.core.rmem_max = 268435456
+net.core.wmem_max = 268435456
+net.ipv4.udp_rmem_min = 32768
+net.ipv4.udp_wmem_min = 32768
+net.ipv4.udp_mem = 262144 524288 1048576
+net.netfilter.nf_conntrack_max = 4194304
+net.netfilter.nf_conntrack_udp_timeout = 10
+net.netfilter.nf_conntrack_udp_timeout_stream = 30
+net.ipv4.ip_local_port_range = 10240 65535
+EOF
+
+  cat > "${LIMITS_FILE}" <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+
+  sysctl -p "${SYSCTL_FILE}" >/dev/null 2>&1 || log "Some sysctl values could not be applied on this kernel"
+}
+
+open_firewall_port_53() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+    ufw allow 53/udp >/dev/null 2>&1 || true
+    ufw allow 53/tcp >/dev/null 2>&1 || true
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port=53/udp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=53/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 53 -j ACCEPT || true
+    iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 53 -j ACCEPT || true
+  fi
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport 53 -j ACCEPT || true
+    ip6tables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport 53 -j ACCEPT || true
+  fi
+}
+
+check_port53_conflict() {
+  local owner
+  owner="$(ss -H -lunp 'sport = :53' 2>/dev/null || true)"
+  [[ -z "${owner}" ]] && return 0
+  if grep -q 'stormdns-proxy' <<< "${owner}"; then
+    return 0
+  fi
+  printf '%s\n' "${owner}" >&2
+  return 1
+}
+
 start_stack() {
   local build="$1"
   local recreate="$2"
@@ -618,7 +955,7 @@ show_status() {
 }
 
 confirm_summary() {
-  if [[ "${ASSUME_YES}" == "yes" || "${NON_INTERACTIVE}" == "yes" ]]; then
+  if [[ "${CONFIRM}" != "yes" || "${NON_INTERACTIVE}" == "yes" ]]; then
     return
   fi
 
@@ -626,6 +963,7 @@ confirm_summary() {
 
 StormDNS god-mode plan:
   Install directory: ${ROOT_DIR}
+  Source tree:       ${SOURCE_DIR:-not found}
   Docker project:    ${DOCKER_DIR}
   Host config:       ${HOST_CONFIG}
   Host key:          ${KEY_FILE}
@@ -633,6 +971,7 @@ StormDNS god-mode plan:
   Proxy binary:      ${PROXY_BIN}
   Containers:        ${INSTANCES}
   Listen address:    ${LISTEN_ADDR}
+  WARP egress:       ${WARP_EGRESS}
 
 EOF
   ask_yes_no "Proceed with cluster rebuild/start?" "yes" || die "aborted"
@@ -662,6 +1001,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --docker-dir=*)
       DOCKER_DIR="${1#*=}"
+      shift
+      ;;
+    --source-dir)
+      SOURCE_DIR="${2:-}"
+      shift 2
+      ;;
+    --source-dir=*)
+      SOURCE_DIR="${1#*=}"
       shift
       ;;
     --server-bin)
@@ -736,6 +1083,10 @@ while [[ $# -gt 0 ]]; do
       PROXY_TIMEOUT="${1#*=}"
       shift
       ;;
+    --no-source-build)
+      BINARY_BUILD="no"
+      shift
+      ;;
     --no-build)
       BUILD="no"
       shift
@@ -744,12 +1095,24 @@ while [[ $# -gt 0 ]]; do
       RECREATE="no"
       shift
       ;;
+    --no-warp-egress)
+      WARP_EGRESS="no"
+      shift
+      ;;
+    --regenerate-key)
+      REGENERATE_KEY="yes"
+      shift
+      ;;
+    --confirm)
+      CONFIRM="yes"
+      shift
+      ;;
     --non-interactive)
       NON_INTERACTIVE="yes"
       shift
       ;;
     -y|--yes)
-      ASSUME_YES="yes"
+      CONFIRM="no"
       shift
       ;;
     -h|--help)
@@ -762,13 +1125,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+ROOT_DIR="$(detect_install_root)"
 ROOT_DIR="$(cd "${ROOT_DIR}" && pwd -P)"
-SOURCE_DIR="$(cd "${SOURCE_DIR}" && pwd -P)"
+SOURCE_DIR="$(detect_source_dir || true)"
+if [[ -n "${SOURCE_DIR}" ]]; then
+  SOURCE_DIR="$(cd "${SOURCE_DIR}" && pwd -P)"
+fi
 DOCKER_DIR="${DOCKER_DIR:-${ROOT_DIR}/stormdns-docker}"
 DOCKER_CONFIG_DIR="${DOCKER_DIR}/config"
 HOST_CONFIG="${HOST_CONFIG:-${ROOT_DIR}/server_config.toml}"
 COMPOSE_FILE="${DOCKER_DIR}/docker-compose.yml"
 DOCKERFILE="${DOCKER_DIR}/Dockerfile"
+WARP_EGRESS_SCRIPT="${ROOT_DIR}/stormdns-warp-egress.sh"
 BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
 
 require_root
@@ -778,6 +1146,7 @@ require_command systemctl
 require_command ss
 require_command sed
 require_command awk
+require_command sysctl
 
 ensure_config
 resolve_binaries
@@ -802,6 +1171,14 @@ backup_file "${COMPOSE_FILE}" "${BACKUP_DIR}"
 backup_file "${DOCKERFILE}" "${BACKUP_DIR}"
 backup_file "${DOCKER_CONFIG_DIR}/server_config.toml" "${BACKUP_DIR}"
 backup_file "${PROXY_UNIT}" "${BACKUP_DIR}"
+backup_file "${WARP_EGRESS_SCRIPT}" "${BACKUP_DIR}"
+backup_file "${WARP_EGRESS_UNIT}" "${BACKUP_DIR}"
+backup_file "${SYSCTL_FILE}" "${BACKUP_DIR}"
+backup_file "${LIMITS_FILE}" "${BACKUP_DIR}"
+
+log "Applying OS UDP tuning and opening port 53"
+apply_os_tuning
+open_firewall_port_53
 
 log "Preparing Docker project for ${INSTANCES} instances"
 prepare_docker_files
@@ -812,13 +1189,28 @@ log "Backend list: ${BACKENDS}"
 
 disable_legacy_services
 stop_unit_hard stormdns-proxy.service
+if ! check_port53_conflict; then
+  die "UDP port 53 is already owned by another process; stop it and rerun"
+fi
 write_proxy_unit "${BACKENDS}"
+if [[ "${WARP_EGRESS}" == "yes" ]]; then
+  write_warp_egress_script
+  write_warp_egress_unit
+fi
 
 systemctl daemon-reload
 systemctl enable docker.service >/dev/null 2>&1 || true
 systemctl enable stormdns-proxy.service >/dev/null
+if [[ "${WARP_EGRESS}" == "yes" ]]; then
+  systemctl enable stormdns-warp-egress.service >/dev/null
+fi
 
 start_stack "${BUILD}" "${RECREATE}"
+
+if [[ "${WARP_EGRESS}" == "yes" ]]; then
+  log "Applying WARP egress routing if a WARP interface exists"
+  systemctl restart stormdns-warp-egress.service || true
+fi
 
 log "Starting proxy"
 systemctl restart stormdns-proxy.service
