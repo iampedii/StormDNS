@@ -10,6 +10,18 @@ detect_root() {
     return
   fi
 
+  for candidate in "$(dirname "${SCRIPT_DIR}")" "${SCRIPT_DIR}" "/root" "/root/StormDNS"; do
+    if [[ -f "${candidate}/server_config.toml" && -f "${candidate}/stormdns-docker/docker-compose.yml" ]]; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+
+  if [[ -f "${SCRIPT_DIR}/go.mod" && -f "$(dirname "${SCRIPT_DIR}")/server_config.toml" ]]; then
+    dirname "${SCRIPT_DIR}"
+    return
+  fi
+
   for candidate in "${SCRIPT_DIR}" "$(dirname "${SCRIPT_DIR}")" "/root/StormDNS"; do
     if [[ -f "${candidate}/stormdns_god_mode.sh" || -f "${candidate}/server_config.toml" || -d "${candidate}/stormdns-docker" ]]; then
       printf '%s\n' "${candidate}"
