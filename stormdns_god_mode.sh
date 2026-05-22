@@ -91,6 +91,105 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
+package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf 'apt\n'
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'dnf\n'
+  elif command -v yum >/dev/null 2>&1; then
+    printf 'yum\n'
+  else
+    return 1
+  fi
+}
+
+refresh_package_index() {
+  local pm="$1"
+  case "${pm}" in
+    apt)
+      if [[ "${APT_UPDATED:-no}" != "yes" ]]; then
+        log "Updating apt package index"
+        DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
+        APT_UPDATED="yes"
+      fi
+      ;;
+  esac
+}
+
+install_package() {
+  local pm="$1"
+  local package="$2"
+  case "${pm}" in
+    apt)
+      refresh_package_index "${pm}"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${package}" >/dev/null
+      ;;
+    dnf)
+      dnf -y install "${package}" >/dev/null
+      ;;
+    yum)
+      yum -y install "${package}" >/dev/null
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_first_available_package() {
+  local label="$1"
+  shift
+  local pm package
+  pm="$(package_manager)" || die "no supported package manager found to install ${label}"
+
+  for package in "$@"; do
+    log "Installing ${label}: ${package}"
+    if install_package "${pm}" "${package}"; then
+      return 0
+    fi
+    log "Package ${package} was not installable; trying next option"
+  done
+
+  die "failed to install ${label}; tried: $*"
+}
+
+has_docker_compose() {
+  docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1
+}
+
+ensure_go() {
+  if command -v go >/dev/null 2>&1; then
+    return
+  fi
+
+  install_first_available_package "Go" golang-go golang
+  require_command go
+}
+
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    install_first_available_package "Docker" docker.io docker-ce moby-engine docker
+  fi
+  require_command docker
+
+  if ! has_docker_compose; then
+    install_first_available_package "Docker Compose" docker-compose-v2 docker-compose-plugin docker-compose
+  fi
+  has_docker_compose || die "Docker Compose is missing after install"
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --all 2>/dev/null | grep -q '^docker\.service'; then
+    log "Enabling and starting docker.service"
+    systemctl enable --now docker.service >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_runtime_tools() {
+  ensure_docker
+  if [[ "${BINARY_BUILD}" == "yes" && -n "${SOURCE_DIR}" ]]; then
+    ensure_go
+  fi
+}
+
 prompt_read() {
   local prompt="$1"
   local var_name="$2"
@@ -137,7 +236,11 @@ ask_yes_no() {
 }
 
 docker_compose() {
-  docker compose "$@"
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
 }
 
 backup_file() {
@@ -1153,8 +1256,7 @@ WARP_EGRESS_SCRIPT="${ROOT_DIR}/stormdns-warp-egress.sh"
 BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
 
 require_root
-require_command docker
-docker compose version >/dev/null 2>&1 || die "docker compose plugin is missing"
+ensure_runtime_tools
 require_command systemctl
 require_command ss
 require_command sed
