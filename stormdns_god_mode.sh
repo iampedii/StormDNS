@@ -302,6 +302,7 @@ ensure_key_file() {
 }
 
 ensure_config() {
+  local domains literal
   if [[ ! -f "${HOST_CONFIG}" && -f "${ROOT_DIR}/server_config.toml.simple" ]]; then
     cp -a "${ROOT_DIR}/server_config.toml.simple" "${HOST_CONFIG}"
     log "Created ${HOST_CONFIG} from server_config.toml.simple"
@@ -309,7 +310,19 @@ ensure_config() {
   require_file "${HOST_CONFIG}"
 
   if grep -Eq '^[[:space:]]*DOMAIN[[:space:]]*=.*v\.domain\.com|^[[:space:]]*DOMAIN[[:space:]]*=[[:space:]]*\[[[:space:]]*\]' "${HOST_CONFIG}"; then
-    die "DOMAIN must be configured in ${HOST_CONFIG} before god mode runs"
+    if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
+      die "DOMAIN must be configured in ${HOST_CONFIG}"
+    fi
+
+    while true; do
+      prompt_read "Enter tunnel domain(s), comma-separated (example: v.example.com): " domains
+      domains="$(trim "${domains}")"
+      [[ -n "${domains}" ]] || continue
+      literal="$(domain_array_literal "${domains}")"
+      set_toml_array_strings "${HOST_CONFIG}" "DOMAIN" "${literal}"
+      log "Configured DOMAIN = ${literal}"
+      break
+    done
   fi
 
   ensure_key_file
