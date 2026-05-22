@@ -40,6 +40,22 @@ CONFIRM="no"
 WARP_EGRESS="yes"
 REGENERATE_KEY="no"
 RUN_MODE=""
+ASSUME_YES="no"
+
+print_banner() {
+  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+
+  cat <<'EOF'
+ __        ___     _ _       ____  _   _ ____
+ \ \      / / |__ (_) |_ ___|  _ \| \ | / ___|
+  \ \ /\ / /| '_ \| | __/ _ \ | | |  \| \___ \
+   \ V  V / | | | | | ||  __/ |_| | |\  |___) |
+    \_/\_/  |_| |_|_|\__\___|____/|_| \_|____/
+
+EOF
+}
 
 usage() {
   cat <<EOF
@@ -69,7 +85,7 @@ Options:
   --regenerate-key        Replace an invalid existing encryption key without prompting.
   --confirm               Ask for confirmation before changing files/services.
   --non-interactive       Use defaults and fail instead of prompting.
-  -y, --yes               Accepted for compatibility; god mode does not confirm by default.
+  -y, --yes               Assume yes for destructive redo confirmation.
   -h, --help              Show this help.
 EOF
 }
@@ -207,25 +223,23 @@ ensure_runtime_tools() {
 prompt_read() {
   local prompt="$1"
   local var_name="$2"
-  local answer=""
+  local reply=""
 
   if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
     printf -v "${var_name}" '%s' ""
     return
   fi
 
-  if [[ -w /dev/tty ]]; then
-    printf '%s' "${prompt}" >/dev/tty
-  else
-    printf '%s' "${prompt}" >&2
+  if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    if { printf '%s' "${prompt}" >/dev/tty && IFS= read -r reply </dev/tty; } 2>/dev/null; then
+      printf -v "${var_name}" '%s' "${reply}"
+      return
+    fi
   fi
 
-  if IFS= read -r answer; then
-    :
-  elif [[ -r /dev/tty ]]; then
-    IFS= read -r answer </dev/tty || true
-  fi
-  printf -v "${var_name}" '%s' "${answer}"
+  printf '%s' "${prompt}" >&2
+  IFS= read -r reply || true
+  printf -v "${var_name}" '%s' "${reply}"
 }
 
 ask_yes_no() {
@@ -276,7 +290,7 @@ backup_file() {
 
 ask_instances() {
   local current default answer
-  current="$(docker ps --format '{{.Names}}' 2>/dev/null | awk '/^stormdns-[0-9]+$/ { n++ } END { print n+0 }')"
+  current="$(docker ps --format '{{.Names}}' </dev/null 2>/dev/null | awk '/^stormdns-[0-9]+$/ { n++ } END { print n+0 }')"
   if [[ "${current}" -gt 0 ]]; then
     default="${current}"
   else
@@ -284,7 +298,7 @@ ask_instances() {
   fi
 
   if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
-    printf '%s\n' "${default}"
+    INSTANCES="${default}"
     return
   fi
 
@@ -292,7 +306,8 @@ ask_instances() {
     prompt_read "How many total StormDNS containers should run? [${default}]: " answer
     answer="${answer:-$default}"
     if [[ "${answer}" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= 200 )); then
-      printf '%s\n' "${answer}"
+      INSTANCES="${answer}"
+      log "Selected ${INSTANCES} StormDNS containers"
       return
     fi
     printf 'Please enter a number from 1 to 200.\n'
@@ -532,16 +547,20 @@ ensure_key_file() {
 }
 
 ensure_config() {
+  local current_domains
   if [[ ! -f "${HOST_CONFIG}" && -f "${ROOT_DIR}/server_config.toml.simple" ]]; then
     cp -a "${ROOT_DIR}/server_config.toml.simple" "${HOST_CONFIG}"
     log "Created ${HOST_CONFIG} from server_config.toml.simple"
   fi
   require_file "${HOST_CONFIG}"
 
-  if config_needs_domain; then
-    if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
-      die "DOMAIN must be configured in ${HOST_CONFIG}"
-    fi
+  current_domains="$(domain_csv)"
+  if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
+    config_needs_domain && die "DOMAIN must be configured in ${HOST_CONFIG}"
+    [[ -n "${current_domains}" ]] || die "DOMAIN must be configured in ${HOST_CONFIG}"
+  elif [[ -n "${current_domains}" ]]; then
+    prompt_set_domains "Enter tunnel domain(s), comma-separated" "${current_domains}"
+  else
     prompt_set_domains "Enter tunnel domain(s), comma-separated (example: v.example.com)"
   fi
 
@@ -609,7 +628,21 @@ choose_run_mode() {
     return
   fi
 
-  log "Existing god-mode deployment detected; clean redo will remove old StormDNS containers and generate a new key/secret"
+  cat >&2 <<EOF
+[stormdns-god] WARNING: Existing god-mode deployment detected.
+[stormdns-god] This run will replace everything managed by god mode:
+[stormdns-god]   - stop StormDNS watchdog/proxy services
+[stormdns-god]   - remove old StormDNS Docker containers and network
+[stormdns-god]   - replace the Docker project files
+[stormdns-god]   - generate and apply a new encryption key/secret
+[stormdns-god]   - recreate all selected backend containers
+EOF
+  if [[ "${ASSUME_YES}" != "yes" ]]; then
+    if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
+      die "redo mode requires -y/--yes in non-interactive mode"
+    fi
+    ask_yes_no "Continue and replace the existing god-mode deployment?" "no" || die "aborted"
+  fi
   RUN_MODE="redo"
   REGENERATE_KEY="yes"
   log "Run mode: ${RUN_MODE}"
@@ -1600,6 +1633,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -y|--yes)
+      ASSUME_YES="yes"
       CONFIRM="no"
       shift
       ;;
@@ -1629,6 +1663,7 @@ WATCHDOG_SCRIPT="${ROOT_DIR}/stormdns_watchdog.py"
 BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
 BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%d%H%M%S)-god-mode"
 
+print_banner
 require_root
 ensure_runtime_tools
 require_command systemctl
@@ -1642,7 +1677,7 @@ ensure_config
 resolve_binaries
 
 if [[ -z "${INSTANCES}" ]]; then
-  INSTANCES="$(ask_instances)"
+  ask_instances
 fi
 
 if ! [[ "${INSTANCES}" =~ ^[0-9]+$ ]] || (( INSTANCES < 1 || INSTANCES > 200 )); then

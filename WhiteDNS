@@ -69,28 +69,30 @@ require_command() {
 prompt_read() {
   local prompt="$1"
   local var_name="$2"
-  local answer=""
+  local reply=""
 
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf '%s' "${prompt}" >/dev/tty
-    IFS= read -r answer </dev/tty || return 1
-  else
-    printf '%s' "${prompt}"
-    IFS= read -r answer || return 1
+  if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    if { printf '%s' "${prompt}" >/dev/tty && IFS= read -r reply </dev/tty; } 2>/dev/null; then
+      printf -v "${var_name}" '%s' "${reply}"
+      return 0
+    fi
   fi
 
-  printf -v "${var_name}" '%s' "${answer}"
+  printf '%s' "${prompt}"
+  IFS= read -r reply || return 1
+  printf -v "${var_name}" '%s' "${reply}"
 }
 
 pause() {
   local unused
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf '\nPress Enter to continue...' >/dev/tty
-    IFS= read -r unused </dev/tty || true
-  elif [[ -t 0 ]]; then
-    printf '\nPress Enter to continue...'
-    IFS= read -r unused || true
+  if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    if { printf '\nPress Enter to continue...' >/dev/tty && IFS= read -r unused </dev/tty; } 2>/dev/null; then
+      return
+    fi
   fi
+  [[ -t 0 ]] || return
+  printf '\nPress Enter to continue...'
+  IFS= read -r unused || true
 }
 
 ask_yes_no() {
