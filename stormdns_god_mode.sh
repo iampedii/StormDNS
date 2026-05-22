@@ -13,8 +13,10 @@ PROXY_BIN="${STORMDNS_PROXY_BIN:-}"
 COMPOSE_FILE=""
 DOCKERFILE=""
 WARP_EGRESS_SCRIPT=""
+WATCHDOG_SCRIPT=""
 PROXY_UNIT="/etc/systemd/system/stormdns-proxy.service"
 WARP_EGRESS_UNIT="/etc/systemd/system/stormdns-warp-egress.service"
+WATCHDOG_UNIT="/etc/systemd/system/stormdns-watchdog.service"
 SYSCTL_FILE="/etc/sysctl.d/99-stormdns.conf"
 LIMITS_FILE="/etc/security/limits.d/99-stormdns.conf"
 BACKUP_ROOT=""
@@ -43,8 +45,8 @@ usage() {
   cat <<EOF
 Usage: sudo $0 [OPTIONS]
 
-Starts the StormDNS Docker backend cluster and the aware UDP proxy frontend.
-On rerun, asks whether to update in place or redo with a new key/secret.
+Starts the StormDNS Docker backend cluster, aware UDP proxy frontend, and watchdog.
+On rerun, performs a clean redo with a new key/secret and removes old containers first.
 
 Options:
   --instances N           Number of StormDNS backend containers.
@@ -185,8 +187,18 @@ ensure_docker() {
   fi
 }
 
+ensure_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    return
+  fi
+
+  install_first_available_package "Python 3" python3
+  require_command python3
+}
+
 ensure_runtime_tools() {
   ensure_docker
+  ensure_python3
   if [[ "${BINARY_BUILD}" == "yes" && -n "${SOURCE_DIR}" ]]; then
     ensure_go
   fi
@@ -202,10 +214,16 @@ prompt_read() {
     return
   fi
 
-  if [[ -r /dev/tty ]]; then
-    read -r -p "${prompt}" answer </dev/tty || true
+  if [[ -w /dev/tty ]]; then
+    printf '%s' "${prompt}" >/dev/tty
   else
-    read -r -p "${prompt}" answer || true
+    printf '%s' "${prompt}" >&2
+  fi
+
+  if IFS= read -r answer; then
+    :
+  elif [[ -r /dev/tty ]]; then
+    IFS= read -r answer </dev/tty || true
   fi
   printf -v "${var_name}" '%s' "${answer}"
 }
@@ -231,9 +249,9 @@ ask_yes_no() {
     answer="$(trim "${answer}")"
     answer="${answer//$'\r'/}"
 
-    case "${answer}" in
-      y|Y|yes|YES|y*|Y*) return 0 ;;
-      n|N|no|NO|n*|N*) return 1 ;;
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
       *) printf 'Please answer yes or no.\n' ;;
     esac
   done
@@ -525,14 +543,6 @@ ensure_config() {
       die "DOMAIN must be configured in ${HOST_CONFIG}"
     fi
     prompt_set_domains "Enter tunnel domain(s), comma-separated (example: v.example.com)"
-  elif [[ "${RUN_MODE}" == "update" ]]; then
-    if ask_yes_no "Add another tunnel domain to the existing DOMAIN list?" "no"; then
-      prompt_add_domains
-    fi
-  elif [[ "${RUN_MODE}" == "redo" ]]; then
-    if [[ "${NON_INTERACTIVE}" != "yes" ]] && ask_yes_no "Replace the DOMAIN list for this redo?" "no"; then
-      prompt_set_domains "Enter tunnel domain(s), comma-separated (example: v.example.com)" "$(domain_csv)"
-    fi
   fi
 
   ensure_key_file
@@ -595,22 +605,13 @@ existing_deployment_detected() {
 choose_run_mode() {
   if ! existing_deployment_detected; then
     RUN_MODE="install"
+    log "Run mode: install"
     return
   fi
 
-  if [[ "${NON_INTERACTIVE}" == "yes" ]]; then
-    RUN_MODE="update"
-    log "Existing god-mode deployment detected; non-interactive run will update in place"
-    return
-  fi
-
-  log "Existing god-mode deployment detected"
-  if ask_yes_no "Update existing implementation and reuse the same encryption key/secret? Choose no to redo with a new key/secret." "yes"; then
-    RUN_MODE="update"
-  else
-    RUN_MODE="redo"
-    REGENERATE_KEY="yes"
-  fi
+  log "Existing god-mode deployment detected; clean redo will remove old StormDNS containers and generate a new key/secret"
+  RUN_MODE="redo"
+  REGENERATE_KEY="yes"
   log "Run mode: ${RUN_MODE}"
 }
 
@@ -816,6 +817,45 @@ disable_legacy_services() {
 
   if command -v ipvsadm >/dev/null 2>&1; then
     ipvsadm -C >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_existing_docker_stack() {
+  local containers
+  log "Redo mode: removing existing StormDNS Docker containers and network"
+
+  if [[ -f "${COMPOSE_FILE}" ]]; then
+    (cd "${DOCKER_DIR}" && docker_compose down --remove-orphans --volumes) >/dev/null 2>&1 || true
+  fi
+
+  containers="$(docker ps -a --filter 'name=^stormdns-[0-9]+$' --format '{{.Names}}' 2>/dev/null || true)"
+  if [[ -n "${containers}" ]]; then
+    # shellcheck disable=SC2086
+    docker rm -f ${containers} >/dev/null 2>&1 || true
+  fi
+
+  docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
+
+  if [[ -d "${DOCKER_DIR}" && "${DOCKER_DIR}" != "/" ]]; then
+    find "${DOCKER_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + >/dev/null 2>&1 || true
+  fi
+}
+
+remove_excess_docker_containers() {
+  local desired="$1"
+  local name suffix
+  local -a stale=()
+
+  while IFS= read -r name; do
+    suffix="${name##*-}"
+    if [[ "${suffix}" =~ ^[0-9]+$ ]] && (( suffix > desired )); then
+      stale+=("${name}")
+    fi
+  done < <(docker ps -a --filter 'name=^stormdns-[0-9]+$' --format '{{.Names}}' 2>/dev/null || true)
+
+  if (( ${#stale[@]} > 0 )); then
+    log "Removing StormDNS containers above selected count (${desired}): ${stale[*]}"
+    docker rm -f "${stale[@]}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -1105,6 +1145,55 @@ WantedBy=multi-user.target
 EOF
 }
 
+install_watchdog_script() {
+  local source="${SOURCE_DIR}/stormdns_watchdog.py"
+  if [[ -f "${source}" ]]; then
+    if [[ "$(readlink -f "${source}")" != "$(readlink -f "${WATCHDOG_SCRIPT}" 2>/dev/null || true)" ]]; then
+      install -m 755 "${source}" "${WATCHDOG_SCRIPT}"
+    else
+      chmod 755 "${WATCHDOG_SCRIPT}"
+    fi
+  elif [[ ! -f "${WATCHDOG_SCRIPT}" ]]; then
+    die "missing watchdog script: ${source}"
+  else
+    chmod 755 "${WATCHDOG_SCRIPT}" || true
+  fi
+}
+
+write_watchdog_unit() {
+  local docker_unit after_line requires_line
+  docker_unit="$(detect_docker_systemd_unit || true)"
+  after_line="After=stormdns-proxy.service"
+  requires_line=""
+  if [[ -n "${docker_unit}" ]]; then
+    after_line="After=${docker_unit} stormdns-proxy.service"
+    requires_line="Requires=${docker_unit}"
+  fi
+
+  cat > "${WATCHDOG_UNIT}" <<EOF
+[Unit]
+Description=StormDNS container and proxy watchdog
+${after_line}
+${requires_line}
+Wants=stormdns-proxy.service
+
+[Service]
+Type=simple
+WorkingDirectory=${ROOT_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment=STORMDNS_WATCHDOG_CONFIG=${HOST_CONFIG}
+Environment=STORMDNS_WATCHDOG_PROXY_UNIT=stormdns-proxy.service
+Environment=STORMDNS_WATCHDOG_CONTAINER_PATTERN=^stormdns-[0-9]+$
+ExecStart=/usr/bin/python3 ${WATCHDOG_SCRIPT} --config ${HOST_CONFIG}
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 apply_os_tuning() {
   cat > "${SYSCTL_FILE}" <<'EOF'
 # StormDNS high-rate UDP tuning
@@ -1311,6 +1400,9 @@ show_status() {
 
   log "Proxy status"
   systemctl --no-pager --full status stormdns-proxy.service | sed -n '1,14p' || true
+
+  log "Watchdog status"
+  systemctl --no-pager --full status stormdns-watchdog.service | sed -n '1,14p' || true
 
   log "UDP listeners on port 53"
   ss -lunp | awk 'NR == 1 || /:53[[:space:]]/'
@@ -1533,6 +1625,7 @@ HOST_CONFIG="${HOST_CONFIG:-${ROOT_DIR}/server_config.toml}"
 COMPOSE_FILE="${DOCKER_DIR}/docker-compose.yml"
 DOCKERFILE="${DOCKER_DIR}/Dockerfile"
 WARP_EGRESS_SCRIPT="${ROOT_DIR}/stormdns-warp-egress.sh"
+WATCHDOG_SCRIPT="${ROOT_DIR}/stormdns_watchdog.py"
 BACKUP_ROOT="${ROOT_DIR}/stormdns-backups"
 BACKUP_DIR="${BACKUP_ROOT}/$(date -u +%Y%m%d%H%M%S)-god-mode"
 
@@ -1569,8 +1662,16 @@ backup_file "${DOCKER_CONFIG_DIR}/server_config.toml" "${BACKUP_DIR}"
 backup_file "${PROXY_UNIT}" "${BACKUP_DIR}"
 backup_file "${WARP_EGRESS_SCRIPT}" "${BACKUP_DIR}"
 backup_file "${WARP_EGRESS_UNIT}" "${BACKUP_DIR}"
+backup_file "${WATCHDOG_SCRIPT}" "${BACKUP_DIR}"
+backup_file "${WATCHDOG_UNIT}" "${BACKUP_DIR}"
 backup_file "${SYSCTL_FILE}" "${BACKUP_DIR}"
 backup_file "${LIMITS_FILE}" "${BACKUP_DIR}"
+
+stop_unit_hard stormdns-watchdog.service
+if [[ "${RUN_MODE}" == "redo" ]]; then
+  stop_unit_hard stormdns-proxy.service
+  cleanup_existing_docker_stack
+fi
 
 log "Applying OS UDP tuning and opening port 53"
 apply_os_tuning
@@ -1585,12 +1686,15 @@ log "Backend list: ${BACKENDS}"
 
 disable_legacy_services
 stop_unit_hard stormdns-proxy.service
+remove_excess_docker_containers "${INSTANCES}"
 release_port53_conflict
 write_proxy_unit "${BACKENDS}"
 if [[ "${WARP_EGRESS}" == "yes" ]]; then
   write_warp_egress_script
   write_warp_egress_unit
 fi
+install_watchdog_script
+write_watchdog_unit
 
 systemctl daemon-reload
 systemctl enable docker.service >/dev/null 2>&1 || true
@@ -1598,6 +1702,7 @@ systemctl enable stormdns-proxy.service >/dev/null
 if [[ "${WARP_EGRESS}" == "yes" ]]; then
   systemctl enable stormdns-warp-egress.service >/dev/null
 fi
+systemctl enable stormdns-watchdog.service >/dev/null
 
 start_stack "${BUILD}" "${RECREATE}"
 
@@ -1608,6 +1713,9 @@ fi
 
 log "Starting proxy"
 systemctl restart stormdns-proxy.service
+
+log "Starting watchdog"
+systemctl restart stormdns-watchdog.service
 
 show_status
 print_connection_summary
